@@ -1,0 +1,16 @@
+[package]
+name = "vyoma-lm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Phase-1: integrated char LM — stored SSM backbone + generated FFN mass"
+
+[dependencies]
+candle-core = { version = "0.8", features = ["metal"] }
+candle-nn = { version = "0.8", features = ["metal"] }
+rand = "0.8"
+anyhow = "1"
+
+[[bin]]
+name = "vyoma-lm"
+path = "src/main.rs"

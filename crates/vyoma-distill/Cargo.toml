@@ -1,0 +1,15 @@
+[package]
+name = "vyoma-distill"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Distillation data pipeline — a teacher generates a corpus OUR model learns from. Teacher is never shipped."
+
+[dependencies]
+anyhow = "1"
+ureq = { version = "2", features = ["json"] }
+serde_json = "1"
+
+[[bin]]
+name = "vyoma-distill"
+path = "src/main.rs"

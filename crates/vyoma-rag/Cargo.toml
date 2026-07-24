@@ -1,0 +1,15 @@
+[package]
+name = "vyoma-rag"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "E3 — externalized knowledge on a REAL model: phi4-mini (3.8B) + retrieval, on the laptop."
+
+[dependencies]
+anyhow = "1"
+ureq = { version = "2", features = ["json"] }
+serde_json = "1"
+
+[[bin]]
+name = "vyoma-rag"
+path = "src/main.rs"

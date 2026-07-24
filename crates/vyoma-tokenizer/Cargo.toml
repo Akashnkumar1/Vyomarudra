@@ -1,0 +1,13 @@
+[package]
+name = "vyoma-tokenizer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Byte-level BPE tokenizer, built from scratch — ours, no external dependency."
+
+[dependencies]
+anyhow = "1"
+
+[[bin]]
+name = "vyoma-tokenizer"
+path = "src/main.rs"

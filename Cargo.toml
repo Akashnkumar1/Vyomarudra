@@ -1,0 +1,16 @@
+# Project Vyomarudra / Vyomarudra — Rust workspace.
+# Grows from Phase-0 falsification experiments toward the full system:
+#   vyoma-e1     : E1 — generative weights (the load-bearing bet)
+#   (future) vyoma-seed, vyoma-manifold, vyoma-lattice, vyoma-store, vyoma-os ...
+[workspace]
+resolver = "2"
+members = ["crates/vyoma-e1", "crates/vyoma-ssm", "crates/vyoma-lm", "crates/vyoma-retrieval", "crates/vyoma-rag", "crates/vyoma-distill", "crates/vyoma-tokenizer"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[profile.release]
+opt-level = 3
+lto = "thin"

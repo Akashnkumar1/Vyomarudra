@@ -1,0 +1,13 @@
+[package]
+name = "vyoma-retrieval"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "E2b — retrieval quality vs library size (Ontological Store, Pillar 4). No training; embed + kNN."
+
+[dependencies]
+anyhow = "1"
+
+[[bin]]
+name = "vyoma-retrieval"
+path = "src/main.rs"

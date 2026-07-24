@@ -1,0 +1,13 @@
+{
+  "target_params": 407050,
+  "full_acc": 0.8908, "full_std": 0.0029,
+  "epochs": 15, "seeds": 2,
+  "configs": [
+    {"chunk": 256, "embed": 16, "hyper_hidden": 32, "comp_fractal": 42.61, "seed_fractal": 9554, "acc_fractal": 0.8521, "std_fractal": 0.0005, "plain_params": 9550, "acc_plain": 0.8529, "std_plain": 0.0007, "edge": -0.0008, "seed_chunked": 36039, "comp_chunked": 11.29},
+    {"chunk": 512, "embed": 8, "hyper_hidden": 16, "comp_fractal": 43.93, "seed_fractal": 9266, "acc_fractal": 0.8530, "std_fractal": 0.0015, "plain_params": 8755, "acc_plain": 0.8489, "std_plain": 0.0001, "edge": 0.0041, "seed_chunked": 16012, "comp_chunked": 25.42},
+    {"chunk": 512, "embed": 4, "hyper_hidden": 8, "comp_fractal": 81.51, "seed_fractal": 4994, "acc_fractal": 0.8262, "std_fractal": 0.0088, "plain_params": 4780, "acc_plain": 0.8308, "std_plain": 0.0003, "edge": -0.0046, "seed_chunked": 8628, "comp_chunked": 47.18},
+    {"chunk": 256, "embed": 4, "hyper_hidden": 8, "comp_fractal": 151.32, "seed_fractal": 2690, "acc_fractal": 0.8202, "std_fractal": 0.0036, "plain_params": 2395, "acc_plain": 0.7861, "std_plain": 0.0060, "edge": 0.0342, "seed_chunked": 10299, "comp_chunked": 39.52},
+    {"chunk": 256, "embed": 2, "hyper_hidden": 4, "comp_fractal": 254.09, "seed_fractal": 1602, "acc_fractal": 0.7883, "std_fractal": 0.0097, "plain_params": 1600, "acc_plain": 0.6956, "std_plain": 0.0037, "edge": 0.0928, "seed_chunked": 6065, "comp_chunked": 67.11},
+    {"chunk": 128, "embed": 2, "hyper_hidden": 4, "comp_fractal": 423.13, "seed_fractal": 962, "acc_fractal": 0.7879, "std_fractal": 0.0045, "plain_params": 805, "acc_plain": 0.3281, "std_plain": 0.0045, "edge": 0.4598, "seed_chunked": 10195, "comp_chunked": 39.93}
+  ]
+}
