@@ -27,6 +27,7 @@ docs (`docs/english/`) stay stable, this file moves.
 | Pillar 5 self-evolution (`MODE=evolve`) | ✅ bounded self-evolution via store writes (no weight edits, no forgetting) + homeostasis veto of contradictions: naive degrades 1.0→0.76 under poison, homeostasis holds ~1.0 (332 rejects). **All 5 pillars now have ours-built corners** |
 | Integrated core (BPE+SSM+MoE, distilled) | ✅ **best BPB 1.867** (1.34 MB, dm=128/dff=192). MoE win **seed-confirmed & scale-invariant**: +0.11 over dense-small at every scale; ≈ dense-big at ½ active; int8 → ¼ RAM |
 | Scaling / Chinchilla | ✅ within-corpus model+compute lowers BPB (2.008→1.847) then flattens = **data-bound at 1.34 MB** (MoE gap shrinks +0.115→+0.062). **Growing to 1.92 MB RECOVERS the gap (+0.062→+0.095)** = adding data relieves the bottleneck, capacity pays again. Model×data×compute scale together. Bottleneck = throughput/compute, not architecture |
+| Real web data + GPU (`vyoma-data`, FineWeb) | ✅✅ first non-teacher, real-web-text result, on Kaggle T4: **MoE 2.677 BPB beats dense-small 2.797 (+0.120) AND dense-big 2.801 (−0.123, 3.1× fewer active params)** on 210M real tokens. Portable CPU/CUDA/Metal build; `ONLY=` split for 2-GPU parallelism |
 | Direction | **Retrieval-centric hybrid + sparse MoE**: our retriever + on-disk store + lean SSM + top-1 experts (STORED + int8, not generated); generation stays an image-regime multiplier; teacher teaches only |
 | Next (all ours) | firm up retrolm at scale (BPE + bigger model/context + more seeds); build a real MoE (Pillar 3); grow the distilled corpus |
 
@@ -58,6 +59,54 @@ stays honest.
 ---
 
 ## Log
+
+### 2026-07-26 — First result on REAL web text (FineWeb), on a real GPU: MoE beats BOTH dense baselines ✅✅
+
+**What.** Left the laptop/teacher-distilled corpus for the first time. New crate
+`vyoma-data` (parquet → text, isolated deps) extracts the `text` column of a
+**FineWeb** shard (HuggingFaceFW/fineweb, `sample/10BT`) — real CommonCrawl web
+text, zero teacher involvement. `vyoma-lm` made portable (CPU default, opt-in
+`cuda`/`metal` cargo features — was Mac-only) and trained on **Kaggle's free T4
+GPU**. Also added `ONLY=small,moe,big` to `MODE=moe` so the three independent
+trainings can be split across separate processes/GPUs via `CUDA_VISIBLE_DEVICES`
+for wall-clock parallelism (no true multi-GPU tensor code — not built).
+
+**Corpus.** One FineWeb shard, capped to 200 MB of extracted text →
+**209,717,526 tokens** (char-level) — ~110× our biggest prior (teacher-distilled)
+corpus, and genuinely diverse open-web text, not synthetic/teacher-generated.
+
+**Result (dm=384, dff=512, E=4, 6000 steps, char tokenizer, T4 GPU).**
+
+| model | BPB | params (active) |
+|---|---|---|
+| dense-small (dff=512) | 2.797 | 550,986 |
+| **MoE (4×512, top-1)** | **2.677** | 1.73M total, **~552,522 active** |
+| dense-big (dff=2048) | 2.801 | 1,732,170 |
+
+Δ(small−MoE) = **+0.120**, Δ(MoE−big) = **−0.123**.
+
+**Verdict — the MoE win holds on real data, and is STRONGER than on the toy corpus.**
+(1) Δ(small−MoE)=+0.120 matches every prior confirmation (+0.109 to +0.115 on the
+laptop) — the architectural advantage is not a teacher-corpus artifact. (2) MoE does
+not merely tie dense-big here — it **beats it outright** (2.677 vs 2.801) with **3.1×
+fewer active params**. Honest read: at a fixed 6000-step budget, one giant FFN
+(dff=2048) is harder to optimize than 4 experts the width of dense-small, so part of
+this edge is likely "easier to train under fixed compute," not pure capacity — but
+that is itself a real, useful capability-per-compute result, and it's the best
+demonstration of Pillar 3's thesis yet.
+
+**Honest scope.** Single run (no seed repeat at this scale yet); char-level (BPE
+next); only 6000 steps sampled from 210M tokens (broad but partial coverage); dense-
+big may close the gap with more steps/tuned LR — worth checking before over-claiming
+the margin. But the core, load-bearing number — MoE beats dense-small — is exactly
+where every smaller-scale run landed, now confirmed on real web-scale text.
+
+**Why it matters.** This is the first time Vyomarudra has trained on real,
+non-teacher-generated web text, and the first time on a real GPU (not the laptop
+CPU). The architecture — built entirely by us — ports and scales cleanly to a
+different data source and a different (cloud) machine with no redesign, only an
+enabling corner (`vyoma-data`) and a portability fix. Free-tier compute (Kaggle T4)
+is a genuine, if modest, step toward the scale the vision needs.
 
 ### 2026-07-25 — Chinchilla confirmed: adding data RELIEVES the data-bound bottleneck (MoE gap recovers +0.062 → +0.095) ✅
 
