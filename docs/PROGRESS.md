@@ -28,6 +28,7 @@ docs (`docs/english/`) stay stable, this file moves.
 | Integrated core (BPE+SSM+MoE, distilled) | ✅ **best BPB 1.867** (1.34 MB, dm=128/dff=192). MoE win **seed-confirmed & scale-invariant**: +0.11 over dense-small at every scale; ≈ dense-big at ½ active; int8 → ¼ RAM |
 | Scaling / Chinchilla | ✅ within-corpus model+compute lowers BPB (2.008→1.847) then flattens = **data-bound at 1.34 MB** (MoE gap shrinks +0.115→+0.062). **Growing to 1.92 MB RECOVERS the gap (+0.062→+0.095)** = adding data relieves the bottleneck, capacity pays again. Model×data×compute scale together. Bottleneck = throughput/compute, not architecture |
 | Real web data + GPU (`vyoma-data`, FineWeb) | ✅✅ first non-teacher, real-web-text result, on Kaggle T4: **MoE 2.677 BPB beats dense-small 2.797 (+0.120) AND dense-big 2.801 (−0.123, 3.1× fewer active params)** on 210M real tokens. Portable CPU/CUDA/Metal build; `ONLY=` split for 2-GPU parallelism |
+| BPE on FineWeb (`vyoma-tokenizer` fineweb) | ✅ **−30% BPB** (2.797→1.936 dense-small; MoE 1.912 best-on-FineWeb) — biggest single lever, confirmed on real web text. MoE edge shrinks +0.120→+0.024 **mechanistically**: at vocab 4096 embed+head = ~89% of params, so FFN (where MoE acts) is only ~11% — same effect, diluted. Fix = grow DFF |
 | Direction | **Retrieval-centric hybrid + sparse MoE**: our retriever + on-disk store + lean SSM + top-1 experts (STORED + int8, not generated); generation stays an image-regime multiplier; teacher teaches only |
 | Next (all ours) | firm up retrolm at scale (BPE + bigger model/context + more seeds); build a real MoE (Pillar 3); grow the distilled corpus |
 
@@ -59,6 +60,45 @@ stays honest.
 ---
 
 ## Log
+
+### 2026-07-26 — BPE on FineWeb: biggest tokenizer win yet, and the MoE edge shrinks (mechanistically explained)
+
+**What.** Added `DATASET=fineweb` + `SAMPLE_MB` to `vyoma-tokenizer` (merges trained
+on a fast, capped sample; reused to BPE-encode the full corpus). Trained merges on
+30 MB of the FineWeb shard (vocab 4096, 3.45 bytes/token, round-trip OK, genuine
+subwords: `" international"`, `" opportunities"`, `" professional"`), then reran the
+same `MODE=moe` comparison with `TOKENIZER=bpe` instead of char, same GPU/config.
+
+**Result (dm=384, dff=512, E=4, 6000 steps, FineWeb, T4 GPU).**
+
+| | char (prior) | BPE (this run) | Δ |
+|---|---|---|---|
+| dense-small | 2.797 | **1.936** | −0.861 (−31%) |
+| MoE | 2.677 | **1.912** | −0.765 (−29%) |
+| dense-big | 2.801 | **1.961** | −0.840 (−30%) |
+| Δ(small−MoE) | +0.120 | **+0.024** | shrank |
+| Δ(MoE−big) | −0.123 | **−0.049** | shrank |
+
+**Verdict 1 — BPE is our biggest single lever, confirmed on real web text.**
+−30% bits/byte, even bigger than the 25% seen on Shakespeare. The tokenizer corner
+generalizes cleanly to open web data.
+
+**Verdict 2 — the MoE edge shrank, and it's mechanistic, not a regression.** At
+vocab=4096 the embedding+output-head layers now dominate the model (~89% of
+dense-small's params, vs ~28% at char-level vocab=202) — MoE only adds capacity to
+the **FFN**, which is now just ~11% of the model (was ~72%). Same underlying FFN
+effect, diluted by a now-much-bigger fixed vocab cost. Normalizing (gain ÷ FFN
+share) gives ~0.17 (char) vs ~0.21 (BPE) — consistent — so the mechanism is intact;
+only its share of the total model changed. MoE still beats both baselines in
+direction, just by less in absolute BPB.
+
+**Honest cross-corpus note.** 1.912 is NOT comparable to the earlier laptop "best"
+(1.832, teacher-distilled corpus) — different held-out text, different intrinsic
+difficulty (open web vs curated). This is our best BPB *on FineWeb specifically*.
+
+**Next (implied by the mechanism).** To see MoE's fuller advantage at this vocab
+size, grow `DFF` so the FFN mass is a bigger share of the model again (the same
+lever that recovered the MoE gap when we added data at the Chinchilla inflection).
 
 ### 2026-07-26 — First result on REAL web text (FineWeb), on a real GPU: MoE beats BOTH dense baselines ✅✅
 
