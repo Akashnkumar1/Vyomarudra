@@ -220,10 +220,35 @@ pub fn embed_all(enc: &Encoder, rows: &[Vec<u8>], dev: &Device) -> Result<Vec<Ve
 #[allow(clippy::too_many_arguments)]
 pub fn train_encoder<S>(
     d: usize, dk: usize, n_layers: usize, steps: usize, bsz: usize, lr: f64, temp: f64,
-    dev: &Device, seed: u64, mut sample: S,
+    dev: &Device, seed: u64, sample: S,
 ) -> Result<(Encoder, f32)>
 where
     S: FnMut(&mut StdRng) -> (Vec<u8>, Vec<u8>),
+{
+    train_encoder_neg::<S, fn(&mut StdRng) -> Vec<u8>>(d, dk, n_layers, steps, bsz, lr, temp, dev, seed, sample, None, 0)
+}
+
+/// As `train_encoder`, plus **out-of-domain negatives**.
+///
+/// Plain in-batch InfoNCE only ever contrasts a query against other documents from
+/// the SAME corpus, so the encoder learns "*which* passage?" and never "is this my
+/// domain at all?" — measured consequence: an out-of-domain prompt scored *higher*
+/// than a correct in-domain match, and no gate threshold could separate them (see
+/// docs/PROGRESS.md, MODE=rag). Fix: append `n_neg` documents drawn from a
+/// DIFFERENT corpus to every batch. They are negatives for every query, so the
+/// model must push foreign text away from the whole in-domain query manifold —
+/// which is exactly the signal a grounding gate needs.
+///
+/// Logits become (B, B+n_neg); targets stay the diagonal. The passage→query
+/// direction uses only the in-domain block (foreign docs have no matching query).
+#[allow(clippy::too_many_arguments)]
+pub fn train_encoder_neg<S, N>(
+    d: usize, dk: usize, n_layers: usize, steps: usize, bsz: usize, lr: f64, temp: f64,
+    dev: &Device, seed: u64, mut sample: S, mut neg_sample: Option<N>, n_neg: usize,
+) -> Result<(Encoder, f32)>
+where
+    S: FnMut(&mut StdRng) -> (Vec<u8>, Vec<u8>),
+    N: FnMut(&mut StdRng) -> Vec<u8>,
 {
     use rand::SeedableRng;
     let enc = Encoder::new(d, dk, n_layers, dev)?;
@@ -241,9 +266,20 @@ where
         }
         let q = enc.forward(&tokens_from(&q_rows, dev)?)?;
         let p = enc.forward(&tokens_from(&p_rows, dev)?)?;
-        let logits = (q.matmul(&p.t()?)? / temp)?;
+        // query→doc: contrast against in-domain docs AND foreign negatives
+        let logits = match (&mut neg_sample, n_neg) {
+            (Some(ns), k) if k > 0 => {
+                let neg_rows: Vec<Vec<u8>> = (0..k).map(|_| ns(&mut rng)).collect();
+                let neg = enc.forward(&tokens_from(&neg_rows, dev)?)?;      // (K, dk)
+                let all = Tensor::cat(&[&p, &neg], 0)?;                      // (B+K, dk)
+                (q.matmul(&all.t()?)? / temp)?                               // (B, B+K)
+            }
+            _ => (q.matmul(&p.t()?)? / temp)?,
+        };
         let loss_q = candle_nn::loss::cross_entropy(&logits, &targets)?;
-        let loss_p = candle_nn::loss::cross_entropy(&logits.t()?.contiguous()?, &targets)?;
+        // doc→query: in-domain block only (foreign docs have no matching query)
+        let logits_p = (p.matmul(&q.t()?)? / temp)?;
+        let loss_p = candle_nn::loss::cross_entropy(&logits_p, &targets)?;
         let loss = ((loss_q + loss_p)? / 2.0)?;
         opt.backward_step(&loss)?;
         last = loss.to_scalar::<f32>()?;

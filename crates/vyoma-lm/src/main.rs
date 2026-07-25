@@ -729,7 +729,12 @@ fn main() -> Result<()> {
         let temp: f32 = std::env::var("TEMP").ok().and_then(|s| s.parse().ok()).unwrap_or(0.8);
         let topk: usize = std::env::var("TOPK").ok().and_then(|s| s.parse().ok()).unwrap_or(40);
         let win: usize = std::env::var("WIN").ok().and_then(|s| s.parse().ok()).unwrap_or(64);
-        let gate: f32 = std::env::var("GATE").ok().and_then(|s| s.parse().ok()).unwrap_or(4.0); // in σ
+        // min cosine to accept retrieved context. 0.68 is the empirically best
+        // threshold from `vyoma-embed MODE=gate` calibration over 200+200 samples
+        // — but note it only achieves ~74% balanced accuracy: the in/out-of-domain
+        // similarity distributions genuinely overlap, so this gate is a useful
+        // filter, NOT a guarantee. Recalibrate per store (MODE=gate NEG=...).
+        let gate: f32 = std::env::var("GATE").ok().and_then(|s| s.parse().ok()).unwrap_or(0.68);
 
         let (st, moe, vocab, dm) = load_moe_ckpt(&ckpt, &dev)?;
         let enc = vyoma_embed::Encoder::load(&retp, &dev)?;
@@ -746,27 +751,28 @@ fn main() -> Result<()> {
         let sim = sims[hit];
         let fetched = String::from_utf8_lossy(&store_recs[hit]).into_owned();
 
-        // P3b — the gate. NOT an absolute cosine threshold: measured, that fails
-        // badly (an out-of-domain prompt scored 0.682 vs 0.643 for a correct match)
-        // because a contrastively-trained encoder maps everything into a narrow
-        // cone, so raw cosine is uncalibrated. Instead ask a RELATIVE question:
-        // is the top hit distinctly better than the store's typical match? Gate on
-        // the z-score of the top similarity against the whole store's distribution
-        // — calibration-free, and it is what "the store actually supports this"
-        // means. GATE is now in standard deviations (default 4).
+        // P3b — the gate: ABSOLUTE cosine threshold, but this only works because the
+        // retriever is trained with out-of-domain negatives (`vyoma-embed NEG=`).
+        // Measured history, both directions:
+        //   * WITHOUT OOD negatives: cosine fails (OOD prompt 0.682 > correct 0.643)
+        //     and a z-score vs the store distribution ALSO fails (3.26σ vs 3.31σ) —
+        //     the encoder simply has no "is this my domain?" signal to threshold.
+        //   * WITH OOD negatives (MODE=gate): cosine separates cleanly (in-domain
+        //     ≥0.697 vs all out-of-domain ≤0.593) while z-score still fails (random
+        //     junk scores 3.67σ). The domain signal lives in the ABSOLUTE similarity;
+        //     z-scoring normalizes exactly that away.
+        // So the fix was the TRAINING, not the statistic. GATE = min cosine.
         let n = sims.len() as f32;
         let mean = sims.iter().sum::<f32>() / n;
-        let sd = (sims.iter().map(|s| (s - mean).powi(2)).sum::<f32>() / n).sqrt().max(1e-6);
-        let z = (sim - mean) / sd;
-        println!("[rag] retrieved (cos={sim:.3}, z={z:.2}σ over store mean {mean:.3}): {:?}",
+        println!("[rag] retrieved (cos={sim:.3}, store mean {mean:.3}): {:?}",
                  &fetched.chars().take(90).collect::<String>());
 
-        let grounded = z >= gate;
+        let grounded = sim >= gate;
         let full = if grounded {
-            println!("[rag] gate ACCEPTED (z {z:.2} ≥ {gate}σ) → grounding generation in retrieved context");
+            println!("[rag] gate ACCEPTED (cos {sim:.3} ≥ {gate}) → grounding generation in retrieved context");
             format!("{fetched}\n{prompt}")
         } else {
-            println!("[rag] gate VETOED (z {z:.2} < {gate}σ) → store does not distinctly support this; generating ungrounded");
+            println!("[rag] gate VETOED (cos {sim:.3} < {gate}) → store does not support this; generating ungrounded");
             prompt.clone()
         };
 

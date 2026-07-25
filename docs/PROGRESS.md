@@ -24,7 +24,8 @@ docs (`docs/english/`) stay stable, this file moves.
 | Generate MoE experts (`MODE=genmoe`) | ❌ negative: gen-MoE 2.957 loses to stored-MoE 2.718 AND dense-small 2.899 — language experts resist generation (as FFNs do). Lesson: **store + quantize the experts**, don't generate them |
 | Capability-per-RAM (`MODE=g1`) | ✅ milestone: **int8 ~free on the real LM mass** (MoE 2.732→2.730); stored int8 MoE beats dense-small-fp32 by −0.146 BPB at EQUAL FFN-RAM and ≈ dense-big at ¼ RAM. Gate-G1-spirit capability-per-GB win, ours |
 | Pillar 3 symbolic lattice (`MODE=lattice`) | ✅ on **digit keys**: symbolic veto → hallucination **100%→0%**, 99% coverage / 100% precision. ⚠️ **Does NOT transfer to text** (see `MODE=rag`): embedding similarity can't separate in/out-of-domain |
-| Assembled system (`MODE=rag`) + checkpoints | ✅ runs end to end (retriever → VYST store → gate → MoE LM); models now **persist** (`SAVE=`, `Encoder::save`) and **generate text**. ❌ **grounding gate does not discriminate** (out-of-domain scored 0.682 vs in-domain 0.643; z 3.26σ vs 3.31σ) — retriever trained without out-of-domain negatives. Safe default = veto |
+| Assembled system (`MODE=rag`) + checkpoints | ✅ runs end to end (retriever → VYST store → gate → MoE LM); models **persist** (`SAVE=`, `Encoder::save`) and **generate text** |
+| Grounding gate (`NEG=`, `MODE=gate`) | ❌→⚠️ **much better, not solved**: without out-of-domain negatives there was NO signal (OOD scored higher than IN; no statistic worked). With foreign negatives there is a real, generalizing signal — but calibrated over 400 samples it gives **74% balanced accuracy at GATE=0.68**, distributions overlap. Useful filter, not a guarantee. Gate = absolute cosine (z-score was the wrong statistic) |
 | Pillar 5 self-evolution (`MODE=evolve`) | ✅ bounded self-evolution via store writes (no weight edits, no forgetting) + homeostasis veto of contradictions: naive degrades 1.0→0.76 under poison, homeostasis holds ~1.0 (332 rejects). **All 5 pillars now have ours-built corners** |
 | Integrated core (BPE+SSM+MoE, distilled) | ✅ **best BPB 1.867** (1.34 MB, dm=128/dff=192). MoE win **seed-confirmed & scale-invariant**: +0.11 over dense-small at every scale; ≈ dense-big at ½ active; int8 → ¼ RAM |
 | Scaling / Chinchilla | ✅ within-corpus model+compute lowers BPB (2.008→1.847) then flattens = **data-bound at 1.34 MB** (MoE gap shrinks +0.115→+0.062). **Growing to 1.92 MB RECOVERS the gap (+0.062→+0.095)** = adding data relieves the bottleneck, capacity pays again. Model×data×compute scale together. Bottleneck = throughput/compute, not architecture |
@@ -61,6 +62,63 @@ stays honest.
 ---
 
 ## Log
+
+### 2026-07-26 — Grounding gate FIXED: out-of-domain negatives give the retriever a "do I know this?" signal ✅
+
+**What.** Direct fix for the previous entry's negative. Added `train_encoder_neg` to
+`vyoma-embed`: every contrastive batch now appends `n_neg` documents drawn from a
+**different corpus**, which are negatives for every query. Plain in-batch InfoNCE
+only contrasts Shakespeare against Shakespeare, teaching *"which passage?"* and never
+*"is this my domain?"* — foreign negatives make the second question learnable.
+Wired via `vyoma-embed MODE=store NEG=distilled.txt NNEG=32`. Added `MODE=gate`, a
+no-LM diagnostic that measures the grounding signal directly across domains.
+
+**Result (`MODE=gate`, store = 1743 Shakespeare passages, negatives = distilled text).**
+
+Seven hand-picked probes looked clean — in-domain 0.697/0.713 vs out-of-domain
+≤0.593 — so I set GATE=0.64 and claimed clean separation. **That was overclaiming
+from a tiny sample, and it broke immediately**: a photosynthesis prompt then scored
+0.643 and was wrongly accepted. So I measured the actual distributions instead
+(200 in-domain held-out fragments vs 200 out-of-domain chunks):
+
+| | p05 | median | p95 |
+|---|---|---|---|
+| in-domain | 0.598 | **0.717** | 0.842 |
+| out-of-domain | 0.487 | **0.624** | 0.745 |
+
+**Best achievable threshold 0.680 → 74.0% balanced accuracy** (accepts 71.5% of
+in-domain, rejects 76.5% of out-of-domain).
+
+**Verdict — a real, large improvement, but NOT clean separation.** Before OOD
+negatives the gate had *no* signal (out-of-domain literally scored higher than
+in-domain; no statistic separated them). After, there is a genuine, generalizing
+signal — it holds for code and random junk, domains never seen as negatives, so the
+encoder learned "not my domain" in general. In-domain retrieval also improved
+(0.458 → 0.558). **But the distributions substantially overlap: ~26% error at the
+best threshold.** The gate is a useful filter, not a guarantee — and the honest
+number is 74%, not the "clean gap" the 7 probes implied.
+
+**Method lesson (worth more than the number).** Hand-picked probes flattered the
+result and I published that before checking; a 400-sample calibration corrected it
+within the hour. `MODE=gate` now reports distributions, the optimal threshold, and
+its true error rates — so thresholds get *calibrated*, not guessed.
+
+**I was wrong about the statistic, and the data says so.** Last entry I replaced the
+absolute-cosine gate with a z-score, reasoning that a contrastive encoder's raw
+cosine is uncalibrated. With OOD negatives the opposite is true: **cosine separates,
+z-score fails** (random junk scores 3.67σ — as high as real Shakespeare — because
+z-scoring normalizes away exactly the absolute-similarity signal that carries the
+domain information). Reverted the gate to absolute cosine. **The fix was the
+training, not the statistic** — no threshold on the old encoder could ever have
+worked, and no clever statistic substitutes for a signal that isn't there.
+
+**Honest scope + what would actually close the gap.** 74% balanced accuracy means
+roughly 1 in 4 decisions is wrong at the boundary — fine as a soft filter, not
+enough to promise "no hallucinated grounding". The store is single-domain
+(Shakespeare); a multi-domain store needs per-domain or learned thresholds. Real
+improvements from here: a bigger/deeper retriever, more and more-diverse negative
+corpora, longer training, and — most promising — making the decision a *learned*
+one (a small supported/unsupported head) rather than a hand-set cosine threshold.
 
 ### 2026-07-26 — The assembled SYSTEM runs (`MODE=rag`) — and an honest negative: the grounding gate does not discriminate
 
