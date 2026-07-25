@@ -583,6 +583,114 @@ where F: Fn() -> Result<Tensor> {
     eval_loss_acc(test_s, test_mask, st, &ffn_of()?, c, l, dev)
 }
 
+// ---------------------------------------------------------------------------
+// Checkpoints — persist a trained model so a run produces a KEEPABLE artifact
+// (previously every training run evaporated on exit). safetensors via candle;
+// the config (vocab/dm/dff/E/layers) is derived from tensor SHAPES on load, so
+// no side-car metadata file can drift out of sync with the weights.
+// ---------------------------------------------------------------------------
+fn save_moe_ckpt(path: &str, st: &Stored, moe: &Moe) -> Result<()> {
+    let mut m: std::collections::HashMap<String, Tensor> = std::collections::HashMap::new();
+    m.insert("embed".into(), st.embed.as_tensor().clone());
+    m.insert("wo".into(), st.wo.as_tensor().clone());
+    m.insert("bo".into(), st.bo.as_tensor().clone());
+    for (i, l) in st.ssm.iter().enumerate() {
+        m.insert(format!("ssm.{i}.a_raw"), l.a_raw.as_tensor().clone());
+        m.insert(format!("ssm.{i}.b_co"), l.b_co.as_tensor().clone());
+        m.insert(format!("ssm.{i}.c_co"), l.c_co.as_tensor().clone());
+        m.insert(format!("ssm.{i}.d_co"), l.d_co.as_tensor().clone());
+    }
+    m.insert("moe.gate".into(), moe.gate.as_tensor().clone());
+    for (i, e) in moe.experts.iter().enumerate() {
+        m.insert(format!("moe.{i}.w1"), e.w1.as_tensor().clone());
+        m.insert(format!("moe.{i}.b1"), e.b1.as_tensor().clone());
+        m.insert(format!("moe.{i}.w2"), e.w2.as_tensor().clone());
+        m.insert(format!("moe.{i}.b2"), e.b2.as_tensor().clone());
+    }
+    candle_core::safetensors::save(&m, path)?;
+    Ok(())
+}
+
+/// Load a checkpoint; returns (Stored, Moe, vocab, dm). Config from shapes.
+fn load_moe_ckpt(path: &str, dev: &Device) -> Result<(Stored, Moe, usize, usize)> {
+    let t = candle_core::safetensors::load(path, dev)?;
+    let g = |k: &str| -> Result<Tensor> {
+        t.get(k).cloned().ok_or_else(|| anyhow::anyhow!("checkpoint missing tensor `{k}`"))
+    };
+    let v = |k: &str| -> Result<Var> { Ok(Var::from_tensor(&g(k)?)?) };
+    let embed = g("embed")?;
+    let (vocab, dm) = embed.dims2()?;
+    let n_layers = (0..).take_while(|i| t.contains_key(&format!("ssm.{i}.a_raw"))).count().max(1);
+    let n_exp = (0..).take_while(|i| t.contains_key(&format!("moe.{i}.w1"))).count();
+    anyhow::ensure!(n_exp > 0, "checkpoint has no experts");
+    let mut ssm = Vec::with_capacity(n_layers);
+    for i in 0..n_layers {
+        ssm.push(SsmLayer {
+            a_raw: v(&format!("ssm.{i}.a_raw"))?, b_co: v(&format!("ssm.{i}.b_co"))?,
+            c_co: v(&format!("ssm.{i}.c_co"))?, d_co: v(&format!("ssm.{i}.d_co"))?,
+        });
+    }
+    let st = Stored { embed: Var::from_tensor(&embed)?, ssm, wo: v("wo")?, bo: v("bo")? };
+    let mut experts = Vec::with_capacity(n_exp);
+    for i in 0..n_exp {
+        experts.push(Expert {
+            w1: v(&format!("moe.{i}.w1"))?, b1: v(&format!("moe.{i}.b1"))?,
+            w2: v(&format!("moe.{i}.w2"))?, b2: v(&format!("moe.{i}.b2"))?,
+        });
+    }
+    Ok((st, Moe { gate: v("moe.gate")?, experts }, vocab, dm))
+}
+
+// ---------------------------------------------------------------------------
+// Standalone BPE codec (from a merges file) — needed to encode a prompt and
+// decode generated tokens back to text. Self-contained: token→bytes is fully
+// derivable from the merge list, so generation needs no corpus.
+// ---------------------------------------------------------------------------
+struct BpeCodec { rank: std::collections::HashMap<(u32, u32), usize>, id_of: std::collections::HashMap<(u32, u32), u32>, bytes_of: Vec<Vec<u8>> }
+impl BpeCodec {
+    fn load(merges_path: &str) -> Result<Self> {
+        let txt = std::fs::read_to_string(merges_path)
+            .map_err(|e| anyhow::anyhow!("need BPE merges at {merges_path} (run vyoma-tokenizer): {e}"))?;
+        let (mut rank, mut id_of) = (std::collections::HashMap::new(), std::collections::HashMap::new());
+        let mut bytes_of: Vec<Vec<u8>> = (0..256u32).map(|b| vec![b as u8]).collect();
+        for (m, line) in txt.lines().enumerate() {
+            let mut it = line.split_whitespace();
+            let a: u32 = it.next().unwrap().parse()?;
+            let b: u32 = it.next().unwrap().parse()?;
+            rank.insert((a, b), m);
+            id_of.insert((a, b), 256 + m as u32);
+            let mut nb = bytes_of[a as usize].clone();
+            nb.extend_from_slice(&bytes_of[b as usize]);
+            bytes_of.push(nb);
+        }
+        Ok(Self { rank, id_of, bytes_of })
+    }
+    fn encode(&self, bytes: &[u8]) -> Vec<u32> {
+        let mut out = Vec::new();
+        for word in pretokenize(bytes) {
+            let mut seq = word;
+            loop {
+                let mut best: Option<(usize, usize)> = None;
+                for i in 0..seq.len().saturating_sub(1) {
+                    if let Some(&r) = self.rank.get(&(seq[i], seq[i + 1])) {
+                        if best.map_or(true, |(br, _)| r < br) { best = Some((r, i)); }
+                    }
+                }
+                let (_, pos) = match best { Some(x) => x, None => break };
+                let id = self.id_of[&(seq[pos], seq[pos + 1])];
+                seq.splice(pos..pos + 2, [id]);
+            }
+            out.extend(seq);
+        }
+        out
+    }
+    fn decode(&self, ids: &[u32]) -> String {
+        let mut b = Vec::new();
+        for &i in ids { if let Some(x) = self.bytes_of.get(i as usize) { b.extend_from_slice(x); } }
+        String::from_utf8_lossy(&b).into_owned()
+    }
+}
+
 fn main() -> Result<()> {
     let steps: usize = std::env::var("STEPS").ok().and_then(|s| s.parse().ok()).unwrap_or(2000);
     let dm: usize = std::env::var("DM").ok().and_then(|s| s.parse().ok()).unwrap_or(64);
@@ -604,6 +712,48 @@ fn main() -> Result<()> {
     println!("[lm] device={devname}");
     let dataset = std::env::var("DATASET").unwrap_or_else(|_| "arith".into());
     let mode = std::env::var("MODE").unwrap_or_else(|_| "sweep".into());
+
+    // --- MODE=generate: load a saved MoE checkpoint and WRITE TEXT. The point of
+    // training something is to use it — this makes Vyomarudra produce language,
+    // not just bits-per-byte. Needs no corpus (BPE token→bytes comes from merges).
+    // Env: LOAD=ckpt.safetensors PROMPT="..." NEW=200 TEMP=0.8 TOPK=40
+    if mode == "generate" {
+        let ckpt = std::env::var("LOAD").map_err(|_| anyhow::anyhow!("MODE=generate needs LOAD=path.safetensors"))?;
+        let (st, moe, vocab, dm) = load_moe_ckpt(&ckpt, &dev)?;
+        let merges = format!("{}/data_cache/bpe_merges.txt", env!("CARGO_MANIFEST_DIR"));
+        let codec = BpeCodec::load(&merges)?;
+        let prompt = std::env::var("PROMPT").unwrap_or_else(|_| "The ".into());
+        let n_new: usize = std::env::var("NEW").ok().and_then(|s| s.parse().ok()).unwrap_or(200);
+        let temp: f32 = std::env::var("TEMP").ok().and_then(|s| s.parse().ok()).unwrap_or(0.8);
+        let topk: usize = std::env::var("TOPK").ok().and_then(|s| s.parse().ok()).unwrap_or(40);
+        let win: usize = std::env::var("WIN").ok().and_then(|s| s.parse().ok()).unwrap_or(64);
+        println!("[gen] ckpt={ckpt} vocab={vocab} dm={dm} experts={} | temp={temp} topk={topk} new={n_new}", moe.experts.len());
+        println!("[gen] prompt: {prompt:?}");
+
+        let mut ctx = codec.encode(prompt.as_bytes());
+        anyhow::ensure!(!ctx.is_empty(), "prompt encoded to zero tokens");
+        let mut rng = StdRng::seed_from_u64(std::env::var("SEED").ok().and_then(|s| s.parse().ok()).unwrap_or(0));
+        for _ in 0..n_new {
+            let s = ctx.len().saturating_sub(win);
+            let w = &ctx[s..];
+            let ids = Tensor::from_vec(w.to_vec(), (1, w.len()), &dev)?;
+            let logits = forward_moe(&ids, &st, &moe, dm, &dev)?.0; // (1*L, vocab)
+            let row: Vec<f32> = logits.narrow(0, w.len() - 1, 1)?.flatten_all()?.to_vec1()?;
+            // top-k + temperature sampling
+            let mut idx: Vec<usize> = (0..row.len()).collect();
+            idx.sort_by(|&a, &b| row[b].partial_cmp(&row[a]).unwrap_or(std::cmp::Ordering::Equal));
+            idx.truncate(topk.max(1).min(row.len()));
+            let scaled: Vec<f32> = idx.iter().map(|&i| row[i] / temp.max(1e-3)).collect();
+            let probs = softmax(&scaled);
+            let r: f32 = rng.gen();
+            let (mut acc, mut pick) = (0.0f32, *idx.last().unwrap());
+            for (j, &p) in probs.iter().enumerate() { acc += p; if r <= acc { pick = idx[j]; break; } }
+            ctx.push(pick as u32);
+        }
+        println!("[gen] ----- Vyomarudra writes -----\n{}", codec.decode(&ctx));
+        println!("[gen] -----------------------------");
+        return Ok(());
+    }
 
     // --- assemble corpus (+ vocab, + optional answer mask) ---
     let tok = std::env::var("TOKENIZER").unwrap_or_else(|_| "char".into());
@@ -945,6 +1095,12 @@ fn main() -> Result<()> {
             let p_moe_total = stm.n_params() + moe.n_params();
             let p_moe_active = stm.n_params() + moe.expert_params() + dm * e_n; // ~one expert + gate
             println!("[lm]   MoE ({e_n}×dff={dff})      BPB={bpb_moe:.3}  total={p_moe_total} active≈{p_moe_active}");
+            // SAVE=path.safetensors → keep the trained model (else it evaporates on exit)
+            if let Ok(p) = std::env::var("SAVE") {
+                save_moe_ckpt(&p, &stm, &moe)?;
+                let kb = std::fs::metadata(&p).map(|m| m.len() as f64 / 1024.0).unwrap_or(0.0);
+                println!("[lm]   saved MoE checkpoint -> {p} ({kb:.0} KB)  [generate: MODE=generate LOAD={p}]");
+            }
             bpb_moe_o = Some(bpb_moe);
         }
 
