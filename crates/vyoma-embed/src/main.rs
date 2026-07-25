@@ -102,9 +102,24 @@ fn main() -> Result<()> {
     let lr = 1e-3;
     let temp = 0.05f64;
 
-    let path = format!("{}/../vyoma-lm/data_cache/tinyshakespeare.txt", env!("CARGO_MANIFEST_DIR"));
-    let bytes = std::fs::read(&path)
-        .map_err(|e| anyhow::anyhow!("need tinyshakespeare at {path}: {e}"))?;
+    // DATASET selects the corpus the store/retriever are built from (text |
+    // distilled | fineweb), matching vyoma-lm. MAX_MB caps how much is loaded so a
+    // 200 MB+ FineWeb extract stays tractable on a laptop or a Kaggle session.
+    let dataset = std::env::var("DATASET").unwrap_or_else(|_| "text".into());
+    let file = match dataset.as_str() {
+        "distilled" => "distilled.txt",
+        "fineweb" => "fineweb.txt",
+        _ => "tinyshakespeare.txt",
+    };
+    let max_mb = env_usize("MAX_MB", 20);
+    let path = format!("{}/../vyoma-lm/data_cache/{file}", env!("CARGO_MANIFEST_DIR"));
+    let full = std::fs::metadata(&path).map_err(|e| anyhow::anyhow!("need corpus at {path}: {e}"))?.len();
+    let bytes = {
+        use std::io::Read;
+        let mut b = Vec::new();
+        std::fs::File::open(&path)?.take((max_mb as u64) * 1024 * 1024).read_to_end(&mut b)?;
+        b
+    };
     let all: Vec<Vec<u8>> = bytes
         .chunks(PASSAGE_LEN)
         .filter(|c| c.len() == PASSAGE_LEN)
@@ -114,8 +129,8 @@ fn main() -> Result<()> {
     let (train, test) = all.split_at(n_train);
     let test: Vec<Vec<u8>> = test.to_vec();
     println!(
-        "[embed] tiny-shakespeare: {} passages ({PASSAGE_LEN}B). train={} test={} (disjoint).",
-        all.len(), train.len(), test.len()
+        "[embed] corpus={file} ({} of {full} bytes, cap {max_mb}MB): {} passages ({PASSAGE_LEN}B). train={} test={} (disjoint).",
+        bytes.len(), all.len(), train.len(), test.len()
     );
     println!("[embed] encoder = byte-embed -> {n_layers}x diagonal-SSM block(s) -> mean-pool -> proj -> L2. InfoNCE temp={temp}.");
     println!("[embed] steps={steps} batch={bsz} d_model={d} layers={n_layers} lr={lr}\n");
