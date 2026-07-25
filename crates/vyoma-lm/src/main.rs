@@ -896,54 +896,79 @@ fn main() -> Result<()> {
     // (dff) active compute? Scored by bits-per-byte on real text. Ours, no teacher.
     if mode == "moe" {
         let e_n: usize = std::env::var("MOE_E").ok().and_then(|s| s.parse().ok()).unwrap_or(4);
+        // ONLY=small,moe,big (comma list; default "all") lets the three independent
+        // trainings be split across separate processes/GPUs (e.g. one on cuda:0, one
+        // on cuda:1 via CUDA_VISIBLE_DEVICES) for wall-clock parallelism — no true
+        // multi-GPU tensor support needed since the three models don't interact.
+        let only = std::env::var("ONLY").unwrap_or_else(|_| "all".into());
+        let want = |name: &str| only == "all" || only.split(',').any(|s| s.trim() == name);
+        let (run_small, run_moe, run_big) = (want("small"), want("moe"), want("big"));
         let merges_path = format!("{}/data_cache/bpe_merges.txt", env!("CARGO_MANIFEST_DIR"));
         let blens = token_byte_lengths(&corpus, &tok, &merges_path)?;
         let tb = &blens[split..];
-        println!("[lm] MODE=moe (Pillar 3) [{tok}]: dense-small(dff={dff}) vs MoE({e_n} experts × dff={dff}, top-1) vs dense-big(dff={})", e_n * dff);
+        println!("[lm] MODE=moe (Pillar 3) [{tok}]: dense-small(dff={dff}) vs MoE({e_n} experts × dff={dff}, top-1) vs dense-big(dff={})  ONLY={only}", e_n * dff);
 
-        // dense-small: single FFN, dff.
-        let cs = Cfg { dm, dff, layers: 1 };
-        let sts = Stored::new(&cs, vocab, &dev)?;
-        let ffs = { let np = ffn_total(&cs); let noise = Tensor::randn(0f32, 1f32, (np,), &dev)?; Var::from_tensor(&noise.mul(&Tensor::from_vec(ffn_prior(&cs), (np,), &dev)?)?)? };
-        let ffs_c = ffs.clone();
-        let mut vs = sts.vars(); vs.push(ffs.clone());
-        train(vs, &|| Ok(ffs_c.as_tensor().clone()), train_s, test_s, test_mask, &sts, &cs, steps, l, bs, lr, 0, &dev)?;
-        let bpb_small = eval_bpb(test_s, tb, &sts, ffs_c.as_tensor(), &cs, l, &dev)?;
-        let p_small = sts.n_params() + ffs_c.as_tensor().elem_count();
+        let mut bpb_small_o: Option<f64> = None;
+        let mut bpb_moe_o: Option<f64> = None;
+        let mut bpb_big_o: Option<f64> = None;
 
-        // MoE: E experts of dff, top-1 routing + load-balance aux.
-        let cm = Cfg { dm, dff, layers: 1 };
-        let stm = Stored::new(&cm, vocab, &dev)?;
-        let moe = Moe::new(dm, dff, e_n, &dev)?;
-        let mut vm = stm.vars(); vm.extend(moe.vars());
-        let mut opt = AdamW::new(vm, ParamsAdamW { lr, ..Default::default() })?;
-        let mut rng = StdRng::seed_from_u64(0);
-        for _ in 0..steps {
-            let (ids, tg) = sample_batch(train_s, bs, l, &mut rng, &dev)?;
-            let (logits, aux) = forward_moe(&ids, &stm, &moe, dm, &dev)?;
-            let ce = candle_nn::loss::cross_entropy(&logits, &tg.reshape((bs * l,))?)?;
-            let loss = (ce + (aux * 0.01)?)?;
-            opt.backward_step(&loss)?;
+        if run_small {
+            // dense-small: single FFN, dff.
+            let cs = Cfg { dm, dff, layers: 1 };
+            let sts = Stored::new(&cs, vocab, &dev)?;
+            let ffs = { let np = ffn_total(&cs); let noise = Tensor::randn(0f32, 1f32, (np,), &dev)?; Var::from_tensor(&noise.mul(&Tensor::from_vec(ffn_prior(&cs), (np,), &dev)?)?)? };
+            let ffs_c = ffs.clone();
+            let mut vs = sts.vars(); vs.push(ffs.clone());
+            train(vs, &|| Ok(ffs_c.as_tensor().clone()), train_s, test_s, test_mask, &sts, &cs, steps, l, bs, lr, 0, &dev)?;
+            let bpb_small = eval_bpb(test_s, tb, &sts, ffs_c.as_tensor(), &cs, l, &dev)?;
+            let p_small = sts.n_params() + ffs_c.as_tensor().elem_count();
+            println!("[lm]   dense-small (dff={dff:4}) BPB={bpb_small:.3}  params={p_small}");
+            bpb_small_o = Some(bpb_small);
         }
-        let bpb_moe = eval_bpb_moe(test_s, tb, &stm, &moe, dm, l, &dev)?;
-        let p_moe_total = stm.n_params() + moe.n_params();
-        let p_moe_active = stm.n_params() + moe.expert_params() + dm * e_n; // ~one expert + gate
 
-        // dense-big: single FFN, E·dff (the capacity upper bound).
-        let cb = Cfg { dm, dff: e_n * dff, layers: 1 };
-        let stb = Stored::new(&cb, vocab, &dev)?;
-        let ffb = { let np = ffn_total(&cb); let noise = Tensor::randn(0f32, 1f32, (np,), &dev)?; Var::from_tensor(&noise.mul(&Tensor::from_vec(ffn_prior(&cb), (np,), &dev)?)?)? };
-        let ffb_c = ffb.clone();
-        let mut vb = stb.vars(); vb.push(ffb.clone());
-        train(vb, &|| Ok(ffb_c.as_tensor().clone()), train_s, test_s, test_mask, &stb, &cb, steps, l, bs, lr, 0, &dev)?;
-        let bpb_big = eval_bpb(test_s, tb, &stb, ffb_c.as_tensor(), &cb, l, &dev)?;
-        let p_big = stb.n_params() + ffb_c.as_tensor().elem_count();
+        if run_moe {
+            // MoE: E experts of dff, top-1 routing + load-balance aux.
+            let cm = Cfg { dm, dff, layers: 1 };
+            let stm = Stored::new(&cm, vocab, &dev)?;
+            let moe = Moe::new(dm, dff, e_n, &dev)?;
+            let mut vm = stm.vars(); vm.extend(moe.vars());
+            let mut opt = AdamW::new(vm, ParamsAdamW { lr, ..Default::default() })?;
+            let mut rng = StdRng::seed_from_u64(0);
+            for _ in 0..steps {
+                let (ids, tg) = sample_batch(train_s, bs, l, &mut rng, &dev)?;
+                let (logits, aux) = forward_moe(&ids, &stm, &moe, dm, &dev)?;
+                let ce = candle_nn::loss::cross_entropy(&logits, &tg.reshape((bs * l,))?)?;
+                let loss = (ce + (aux * 0.01)?)?;
+                opt.backward_step(&loss)?;
+            }
+            let bpb_moe = eval_bpb_moe(test_s, tb, &stm, &moe, dm, l, &dev)?;
+            let p_moe_total = stm.n_params() + moe.n_params();
+            let p_moe_active = stm.n_params() + moe.expert_params() + dm * e_n; // ~one expert + gate
+            println!("[lm]   MoE ({e_n}×dff={dff})      BPB={bpb_moe:.3}  total={p_moe_total} active≈{p_moe_active}");
+            bpb_moe_o = Some(bpb_moe);
+        }
 
-        println!("[lm]   dense-small (dff={dff:4}) BPB={bpb_small:.3}  params={p_small}");
-        println!("[lm]   MoE ({e_n}×dff={dff})      BPB={bpb_moe:.3}  total={p_moe_total} active≈{p_moe_active}");
-        println!("[lm]   dense-big  (dff={:4}) BPB={bpb_big:.3}  params={p_big}", e_n * dff);
-        println!("[lm]   Δ(small−moe)={:+.3}  Δ(moe−big)={:+.3}", bpb_small - bpb_moe, bpb_moe - bpb_big);
-        println!("[lm] done (moe). MoE < dense-small AND ≈ dense-big at ~dense-small ACTIVE params ⇒ sparse capacity wins (Pillar 3). Ours.");
+        if run_big {
+            // dense-big: single FFN, E·dff (the capacity upper bound).
+            let cb = Cfg { dm, dff: e_n * dff, layers: 1 };
+            let stb = Stored::new(&cb, vocab, &dev)?;
+            let ffb = { let np = ffn_total(&cb); let noise = Tensor::randn(0f32, 1f32, (np,), &dev)?; Var::from_tensor(&noise.mul(&Tensor::from_vec(ffn_prior(&cb), (np,), &dev)?)?)? };
+            let ffb_c = ffb.clone();
+            let mut vb = stb.vars(); vb.push(ffb.clone());
+            train(vb, &|| Ok(ffb_c.as_tensor().clone()), train_s, test_s, test_mask, &stb, &cb, steps, l, bs, lr, 0, &dev)?;
+            let bpb_big = eval_bpb(test_s, tb, &stb, ffb_c.as_tensor(), &cb, l, &dev)?;
+            let p_big = stb.n_params() + ffb_c.as_tensor().elem_count();
+            println!("[lm]   dense-big  (dff={:4}) BPB={bpb_big:.3}  params={p_big}", e_n * dff);
+            bpb_big_o = Some(bpb_big);
+        }
+
+        if let (Some(bs_), Some(bm_)) = (bpb_small_o, bpb_moe_o) {
+            println!("[lm]   Δ(small−moe)={:+.3}", bs_ - bm_);
+        }
+        if let (Some(bm_), Some(bb_)) = (bpb_moe_o, bpb_big_o) {
+            println!("[lm]   Δ(moe−big)={:+.3}", bm_ - bb_);
+        }
+        println!("[lm] done (moe, ONLY={only}). Split across GPUs: CUDA_VISIBLE_DEVICES=0 ONLY=small,moe ... & CUDA_VISIBLE_DEVICES=1 ONLY=big ... &");
         return Ok(());
     }
 
