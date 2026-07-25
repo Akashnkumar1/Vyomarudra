@@ -125,6 +125,48 @@ impl Encoder {
     pub fn n_params(&self) -> usize {
         self.vars().iter().map(|v| v.elem_count()).sum()
     }
+
+    /// Persist the trained retriever (safetensors). Without this the encoder
+    /// evaporates on exit and a VYST store becomes unusable — its int8 keys are
+    /// only meaningful to the exact encoder that produced them. Store + encoder
+    /// are a matched pair; save them together.
+    pub fn save(&self, path: &str) -> Result<()> {
+        let mut m: std::collections::HashMap<String, Tensor> = std::collections::HashMap::new();
+        m.insert("emb".into(), self.emb.as_tensor().clone());
+        m.insert("w_proj".into(), self.w_proj.as_tensor().clone());
+        m.insert("b_proj".into(), self.b_proj.as_tensor().clone());
+        for (i, l) in self.layers.iter().enumerate() {
+            m.insert(format!("l.{i}.w_in"), l.w_in.as_tensor().clone());
+            m.insert(format!("l.{i}.a_raw"), l.a_raw.as_tensor().clone());
+            m.insert(format!("l.{i}.b_coef"), l.b_coef.as_tensor().clone());
+            m.insert(format!("l.{i}.c_coef"), l.c_coef.as_tensor().clone());
+        }
+        candle_core::safetensors::save(&m, path)?;
+        Ok(())
+    }
+
+    /// Load a saved retriever. Geometry (d, dk, n_layers) comes from tensor
+    /// shapes, so weights and config can never drift apart.
+    pub fn load(path: &str, dev: &Device) -> Result<Self> {
+        let t = candle_core::safetensors::load(path, dev)?;
+        let g = |k: &str| -> Result<Tensor> {
+            t.get(k).cloned().ok_or_else(|| anyhow::anyhow!("retriever ckpt missing `{k}`"))
+        };
+        let v = |k: &str| -> Result<Var> { Ok(Var::from_tensor(&g(k)?)?) };
+        let emb = g("emb")?;
+        let (_vocab, d) = emb.dims2()?;
+        let w_proj = g("w_proj")?;
+        let (_d2, dk) = w_proj.dims2()?;
+        let n = (0..).take_while(|i| t.contains_key(&format!("l.{i}.w_in"))).count().max(1);
+        let mut layers = Vec::with_capacity(n);
+        for i in 0..n {
+            layers.push(Layer {
+                w_in: v(&format!("l.{i}.w_in"))?, a_raw: v(&format!("l.{i}.a_raw"))?,
+                b_coef: v(&format!("l.{i}.b_coef"))?, c_coef: v(&format!("l.{i}.c_coef"))?,
+            });
+        }
+        Ok(Self { emb: Var::from_tensor(&emb)?, layers, w_proj: Var::from_tensor(&w_proj)?, b_proj: v("b_proj")?, d, dk })
+    }
     /// tokens: (B, T) u32 -> L2-normalized embeddings (B, dk)
     pub fn forward(&self, tokens: &Tensor) -> Result<Tensor> {
         let (bsz, t_len) = tokens.dims2()?;

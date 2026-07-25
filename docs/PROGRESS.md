@@ -23,7 +23,8 @@ docs (`docs/english/`) stay stable, this file moves.
 | Pillar 3 MoE (`vyoma-lm MODE=moe`) | ✅ sparse top-1 MoE (ours): **BPB 2.682 vs dense-small 2.866 (+0.184) and dense-big 2.711 (−0.029)** at ~dense-small ACTIVE params — big-model quality at small active cost. Toy computes all experts (quality-per-param shown, not yet FLOP saving) |
 | Generate MoE experts (`MODE=genmoe`) | ❌ negative: gen-MoE 2.957 loses to stored-MoE 2.718 AND dense-small 2.899 — language experts resist generation (as FFNs do). Lesson: **store + quantize the experts**, don't generate them |
 | Capability-per-RAM (`MODE=g1`) | ✅ milestone: **int8 ~free on the real LM mass** (MoE 2.732→2.730); stored int8 MoE beats dense-small-fp32 by −0.146 BPB at EQUAL FFN-RAM and ≈ dense-big at ¼ RAM. Gate-G1-spirit capability-per-GB win, ours |
-| Pillar 3 symbolic lattice (`MODE=lattice`) | ✅ hallucination killer: symbolic veto over retrieved candidate → unanswerable hallucination **100%→0%**, answerable 99% coverage / 100% precision. Trinity's symbolic half, ours |
+| Pillar 3 symbolic lattice (`MODE=lattice`) | ✅ on **digit keys**: symbolic veto → hallucination **100%→0%**, 99% coverage / 100% precision. ⚠️ **Does NOT transfer to text** (see `MODE=rag`): embedding similarity can't separate in/out-of-domain |
+| Assembled system (`MODE=rag`) + checkpoints | ✅ runs end to end (retriever → VYST store → gate → MoE LM); models now **persist** (`SAVE=`, `Encoder::save`) and **generate text**. ❌ **grounding gate does not discriminate** (out-of-domain scored 0.682 vs in-domain 0.643; z 3.26σ vs 3.31σ) — retriever trained without out-of-domain negatives. Safe default = veto |
 | Pillar 5 self-evolution (`MODE=evolve`) | ✅ bounded self-evolution via store writes (no weight edits, no forgetting) + homeostasis veto of contradictions: naive degrades 1.0→0.76 under poison, homeostasis holds ~1.0 (332 rejects). **All 5 pillars now have ours-built corners** |
 | Integrated core (BPE+SSM+MoE, distilled) | ✅ **best BPB 1.867** (1.34 MB, dm=128/dff=192). MoE win **seed-confirmed & scale-invariant**: +0.11 over dense-small at every scale; ≈ dense-big at ½ active; int8 → ¼ RAM |
 | Scaling / Chinchilla | ✅ within-corpus model+compute lowers BPB (2.008→1.847) then flattens = **data-bound at 1.34 MB** (MoE gap shrinks +0.115→+0.062). **Growing to 1.92 MB RECOVERS the gap (+0.062→+0.095)** = adding data relieves the bottleneck, capacity pays again. Model×data×compute scale together. Bottleneck = throughput/compute, not architecture |
@@ -60,6 +61,62 @@ stays honest.
 ---
 
 ## Log
+
+### 2026-07-26 — The assembled SYSTEM runs (`MODE=rag`) — and an honest negative: the grounding gate does not discriminate
+
+**What.** Two enabling corners, then the first end-to-end run of the whole
+architecture as ONE pipeline:
+- **Checkpoints.** `save_moe_ckpt`/`load_moe_ckpt` (safetensors; config derived from
+  tensor *shapes*, so weights/config can't drift). `SAVE=` on `MODE=moe`. Previously
+  every trained model evaporated on exit.
+- **Retriever persistence.** `Encoder::save/load` in `vyoma-embed`; `MODE=store` now
+  writes `retriever.safetensors` beside `ontological_store.vyst` — a **matched pair**
+  (int8 keys are only meaningful to the encoder that made them).
+- **`MODE=generate`.** Loads a checkpoint and writes text (top-k + temperature,
+  standalone `BpeCodec` from the merges file). The model finally *speaks*.
+- **`MODE=rag`.** The assembled system: our retriever → our on-disk VYST store →
+  grounding gate → stored-MoE LM generation. No teacher, no external model.
+
+**It runs, and retrieval is genuinely apt.** Prompt *"Who will believe thee,
+Isabel?"* → fetched *"...'tis incredible to belie[ve]"* (cos 0.643) — our learned
+retriever found a semantically related passage. Generation then produced real
+Shakespearean structure (`BENVOLIO:`, `BRUTUS:`, verse lines, "O heaven", "my lord");
+content is incoherent at this scale (1500 steps, 460 K params), as expected.
+
+**The honest negative — the gate can't tell supported from unsupported.**
+
+| prompt | cos | z-score |
+|---|---|---|
+| in-domain (Shakespeare) | 0.643 | 3.31σ |
+| out-of-domain (Python code) | **0.682** | 3.26σ |
+
+An **out-of-domain prompt scored HIGHER** than the correct one. Switching from an
+absolute cosine threshold to a calibration-free **z-score vs the whole store** (the
+principled fix) didn't help either: 3.31σ vs 3.26σ — indistinguishable. No threshold
+on any of these statistics separates the cases.
+
+**Why (root cause, not a tuning issue).** The retriever is trained contrastively with
+**in-batch negatives drawn from the same corpus**. That teaches *"which Shakespeare
+passage is nearest?"* — never *"is this Shakespeare at all?"* It therefore has **no
+out-of-domain detection capability**, and a contrastive encoder maps everything into
+a narrow cone, so raw cosine is uncalibrated. The gate has no signal to act on.
+
+**This qualifies the `MODE=lattice` result.** That hallucination veto (100%→0%) used
+**exact symbolic consistency** on digit keys, where in-store and out-of-store are
+crisply separable. It does **not** transfer to embedding similarity over natural
+text — the caveat logged then is now demonstrated, with numbers.
+
+**Safe default, and the real fixes.** With `GATE=4σ` both cases veto, so the system
+degrades to *ungrounded generation* rather than confidently grounding on a bad match
+— the safe failure direction. Actual fixes, in order of honesty:
+1. **Train the retriever with out-of-domain negatives** (contrast Shakespeare against
+   other corpora) so "not my domain" becomes learnable. This is the real fix.
+2. **Lexical/symbolic overlap** as the gate (domain-agnostic, closer in spirit to the
+   digit-key check that worked) instead of embedding similarity.
+3. A calibration set to pick the threshold empirically, rather than by intuition.
+
+Reported as a negative because it is one: the pipeline composes and runs, but
+**grounding is not yet trustworthy**, and no amount of threshold-fiddling fixes it.
 
 ### 2026-07-26 — BPE on FineWeb: biggest tokenizer win yet, and the MoE edge shrinks (mechanistically explained)
 

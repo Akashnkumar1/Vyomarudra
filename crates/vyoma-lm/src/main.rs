@@ -713,6 +713,91 @@ fn main() -> Result<()> {
     let dataset = std::env::var("DATASET").unwrap_or_else(|_| "arith".into());
     let mode = std::env::var("MODE").unwrap_or_else(|_| "sweep".into());
 
+    // --- MODE=rag: THE ASSEMBLED SYSTEM. Every pillar in one command, ours:
+    //   P4 our retriever + our on-disk VYST store  → fetch supporting context
+    //   P3b symbolic/similarity gate               → veto unsupported context
+    //        (abstain from grounding rather than condition on a bad match)
+    //   P2+P3 lean SSM + stored MoE (checkpoint)   → generate the answer
+    // No teacher, no external model. Env: LOAD (LM ckpt), RET (retriever ckpt),
+    // STORE (.vyst), PROMPT, NEW, TEMP, TOPK, GATE (min cosine to accept context).
+    if mode == "rag" {
+        let ckpt = std::env::var("LOAD").map_err(|_| anyhow::anyhow!("MODE=rag needs LOAD=lm.safetensors"))?;
+        let retp = std::env::var("RET").map_err(|_| anyhow::anyhow!("MODE=rag needs RET=retriever.safetensors"))?;
+        let storep = std::env::var("STORE").map_err(|_| anyhow::anyhow!("MODE=rag needs STORE=path.vyst"))?;
+        let prompt = std::env::var("PROMPT").unwrap_or_else(|_| "The ".into());
+        let n_new: usize = std::env::var("NEW").ok().and_then(|s| s.parse().ok()).unwrap_or(200);
+        let temp: f32 = std::env::var("TEMP").ok().and_then(|s| s.parse().ok()).unwrap_or(0.8);
+        let topk: usize = std::env::var("TOPK").ok().and_then(|s| s.parse().ok()).unwrap_or(40);
+        let win: usize = std::env::var("WIN").ok().and_then(|s| s.parse().ok()).unwrap_or(64);
+        let gate: f32 = std::env::var("GATE").ok().and_then(|s| s.parse().ok()).unwrap_or(4.0); // in σ
+
+        let (st, moe, vocab, dm) = load_moe_ckpt(&ckpt, &dev)?;
+        let enc = vyoma_embed::Encoder::load(&retp, &dev)?;
+        let (store_embs, store_recs) = vyoma_embed::load_store(&storep)?;
+        let codec = BpeCodec::load(&format!("{}/data_cache/bpe_merges.txt", env!("CARGO_MANIFEST_DIR")))?;
+        println!("[rag] LM(vocab={vocab} dm={dm} experts={}) + retriever(dk={}) + store({} facts)",
+                 moe.experts.len(), enc.dk, store_recs.len());
+        println!("[rag] prompt: {prompt:?}");
+
+        // P4 — retrieve with OUR encoder over OUR store
+        let q = vyoma_embed::embed_all(&enc, &[prompt.as_bytes().to_vec()], &dev)?;
+        let sims: Vec<f32> = store_embs.iter().map(|e| vyoma_embed::dot(&q[0], e)).collect();
+        let hit = (0..sims.len()).max_by(|&a, &b| sims[a].partial_cmp(&sims[b]).unwrap_or(std::cmp::Ordering::Equal)).unwrap();
+        let sim = sims[hit];
+        let fetched = String::from_utf8_lossy(&store_recs[hit]).into_owned();
+
+        // P3b — the gate. NOT an absolute cosine threshold: measured, that fails
+        // badly (an out-of-domain prompt scored 0.682 vs 0.643 for a correct match)
+        // because a contrastively-trained encoder maps everything into a narrow
+        // cone, so raw cosine is uncalibrated. Instead ask a RELATIVE question:
+        // is the top hit distinctly better than the store's typical match? Gate on
+        // the z-score of the top similarity against the whole store's distribution
+        // — calibration-free, and it is what "the store actually supports this"
+        // means. GATE is now in standard deviations (default 4).
+        let n = sims.len() as f32;
+        let mean = sims.iter().sum::<f32>() / n;
+        let sd = (sims.iter().map(|s| (s - mean).powi(2)).sum::<f32>() / n).sqrt().max(1e-6);
+        let z = (sim - mean) / sd;
+        println!("[rag] retrieved (cos={sim:.3}, z={z:.2}σ over store mean {mean:.3}): {:?}",
+                 &fetched.chars().take(90).collect::<String>());
+
+        let grounded = z >= gate;
+        let full = if grounded {
+            println!("[rag] gate ACCEPTED (z {z:.2} ≥ {gate}σ) → grounding generation in retrieved context");
+            format!("{fetched}\n{prompt}")
+        } else {
+            println!("[rag] gate VETOED (z {z:.2} < {gate}σ) → store does not distinctly support this; generating ungrounded");
+            prompt.clone()
+        };
+
+        // P2+P3 — generate with the stored-MoE LM
+        let mut ctx = codec.encode(full.as_bytes());
+        anyhow::ensure!(!ctx.is_empty(), "prompt encoded to zero tokens");
+        let start = ctx.len();
+        let mut rng = StdRng::seed_from_u64(std::env::var("SEED").ok().and_then(|s| s.parse().ok()).unwrap_or(0));
+        for _ in 0..n_new {
+            let s = ctx.len().saturating_sub(win);
+            let w = &ctx[s..];
+            let ids = Tensor::from_vec(w.to_vec(), (1, w.len()), &dev)?;
+            let logits = forward_moe(&ids, &st, &moe, dm, &dev)?.0;
+            let row: Vec<f32> = logits.narrow(0, w.len() - 1, 1)?.flatten_all()?.to_vec1()?;
+            let mut idx: Vec<usize> = (0..row.len()).collect();
+            idx.sort_by(|&a, &b| row[b].partial_cmp(&row[a]).unwrap_or(std::cmp::Ordering::Equal));
+            idx.truncate(topk.max(1).min(row.len()));
+            let scaled: Vec<f32> = idx.iter().map(|&i| row[i] / temp.max(1e-3)).collect();
+            let probs = softmax(&scaled);
+            let r: f32 = rng.gen();
+            let (mut acc, mut pick) = (0.0f32, *idx.last().unwrap());
+            for (j, &p) in probs.iter().enumerate() { acc += p; if r <= acc { pick = idx[j]; break; } }
+            ctx.push(pick as u32);
+        }
+        println!("[rag] ----- Vyomarudra (grounded={grounded}) -----");
+        println!("{}", codec.decode(&ctx[start..]));
+        println!("[rag] --------------------------------------------");
+        println!("[rag] Retriever + store + gate + MoE LM, one pipeline, every corner ours. No teacher.");
+        return Ok(());
+    }
+
     // --- MODE=generate: load a saved MoE checkpoint and WRITE TEXT. The point of
     // training something is to use it — this makes Vyomarudra produce language,
     // not just bits-per-byte. Needs no corpus (BPE token→bytes comes from merges).

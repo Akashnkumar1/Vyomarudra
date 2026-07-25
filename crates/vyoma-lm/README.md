@@ -47,6 +47,27 @@ corpus = `data_cache/tinyshakespeare.txt` (fetched via `curl -skL`).
 | **`g1`** | **capability-per-RAM** (Gate-G1 spirit): lean SSM + stored MoE vs dense, at fp32 & int8 on the FFN mass | int8 ~free (2.732→2.730); MoE-int8 beats dense-small-fp32 −0.146 BPB at equal RAM, ≈ dense-big at ¼ RAM ✅ |
 | **`lattice`** | **Pillar 3 symbolic half**: continuous retrieval + a symbolic (Hamming) consistency veto that abstains on unsupported queries (env `LN`/`TAU`) | hallucinations 100%→0% on unanswerable; 99% coverage / 100% precision on answerable ✅ |
 | **`evolve`** | **Pillar 5**: bounded self-evolution via store writes + homeostasis controller (symbolic veto of contradictory writes) (env `ROUNDS`/`PERROUND`) | naive degrades 1.0→0.76 under poison; homeostasis holds ~1.0 (rejects contradictions) ✅ |
+| **`generate`** | load a saved checkpoint and **write text** (top-k + temperature) — `LOAD` `PROMPT` `NEW` `TEMP` `TOPK` `WIN` `SEED` | the model finally *speaks* |
+| **`rag`** | **the assembled system**: our retriever → our on-disk VYST store → similarity gate (veto unsupported context) → stored-MoE LM generation. `LOAD` `RET` `STORE` `GATE` + generate envs | every pillar in one pipeline, no teacher |
+
+## Checkpoints — runs produce a model you keep
+
+Training used to evaporate on exit. Now `SAVE=path.safetensors` on `MODE=moe`
+persists the model (config is derived from tensor **shapes** on load, so weights and
+config can't drift apart), and `vyoma-embed MODE=store` saves the retriever next to
+its store (`retriever.safetensors` + `ontological_store.vyst` — a **matched pair**:
+int8 keys are only meaningful to the encoder that produced them).
+
+```bash
+# 1) train + keep the LM
+SAVE=vyoma.safetensors DATASET=fineweb TOKENIZER=bpe MODE=moe ONLY=moe STEPS=30000 \
+  DM=384 DFF=512 MOE_E=4 ./target/release/vyoma-lm
+# 2) read what it writes
+MODE=generate LOAD=vyoma.safetensors PROMPT="The " NEW=300 ./target/release/vyoma-lm
+# 3) the whole system: retrieve → gate → generate
+MODE=rag LOAD=vyoma.safetensors RET=../vyoma-embed/data_cache/retriever.safetensors \
+  STORE=../vyoma-embed/data_cache/ontological_store.vyst PROMPT="..." ./target/release/vyoma-lm
+```
 
 ```bash
 # RETRO-lite: our retriever + our store + our LM, end to end, no teacher.

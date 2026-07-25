@@ -155,7 +155,12 @@ fn main() -> Result<()> {
         std::fs::create_dir_all(format!("{}/data_cache", env!("CARGO_MANIFEST_DIR")))?;
         let size = write_store(&store_path, &test, &embs)?;
         let (disk_embs, disk_recs) = load_store(&store_path)?;
+        // Persist the encoder next to the store — the int8 keys are only meaningful
+        // to the encoder that produced them, so they are a matched pair.
+        let enc_path = format!("{}/data_cache/retriever.safetensors", env!("CARGO_MANIFEST_DIR"));
+        enc.save(&enc_path)?;
         println!("[store] wrote {} facts to {store_path}", disk_recs.len());
+        println!("[store] wrote retriever -> {enc_path} (store+encoder are a matched pair)");
         println!("[store] file {:.1} KB = {:.1} bytes/fact (int8 key dk={dk} + text)", size as f64 / 1024.0, size as f64 / test.len() as f64);
         let q_clean = embed_all(&enc, &test_frags[0], &dev)?;
         let q_noise = embed_all(&enc, &test_frags[1], &dev)?;
