@@ -6,11 +6,18 @@ license.workspace = true
 description = "Phase-1: integrated char LM — stored SSM backbone + generated FFN mass"
 
 [dependencies]
-candle-core = { version = "0.8", features = ["metal"] }
-candle-nn = { version = "0.8", features = ["metal"] }
+candle-core = "0.8"
+candle-nn = "0.8"
 rand = "0.8"
 anyhow = "1"
 vyoma-embed = { path = "../vyoma-embed" }
+
+# Accelerators are opt-in so the default (CPU) build compiles anywhere
+# (Kaggle/Linux, Mac). Enable one:  cargo run --release --features cuda
+[features]
+default = []
+cuda = ["candle-core/cuda", "candle-nn/cuda"]
+metal = ["candle-core/metal", "candle-nn/metal"]
 
 [[bin]]
 name = "vyoma-lm"

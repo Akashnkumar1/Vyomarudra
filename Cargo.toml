@@ -4,7 +4,7 @@
 #   (future) vyoma-seed, vyoma-manifold, vyoma-lattice, vyoma-store, vyoma-os ...
 [workspace]
 resolver = "2"
-members = ["crates/vyoma-e1", "crates/vyoma-ssm", "crates/vyoma-lm", "crates/vyoma-retrieval", "crates/vyoma-rag", "crates/vyoma-distill", "crates/vyoma-tokenizer", "crates/vyoma-embed"]
+members = ["crates/vyoma-e1", "crates/vyoma-ssm", "crates/vyoma-lm", "crates/vyoma-retrieval", "crates/vyoma-rag", "crates/vyoma-distill", "crates/vyoma-tokenizer", "crates/vyoma-embed", "crates/vyoma-data"]
 
 [workspace.package]
 version = "0.1.0"

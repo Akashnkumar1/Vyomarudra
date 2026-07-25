@@ -1,0 +1,15 @@
+[package]
+name = "vyoma-data"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "FineWeb (and other parquet) → training text for OUR model. Isolated parquet deps so they never touch the model crates."
+
+[dependencies]
+anyhow = "1"
+parquet = { version = "53", features = ["arrow"] }
+arrow = "53"
+
+[[bin]]
+name = "vyoma-data"
+path = "src/main.rs"

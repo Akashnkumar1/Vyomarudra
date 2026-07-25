@@ -590,22 +590,26 @@ fn main() -> Result<()> {
     let l: usize = std::env::var("SEQ").ok().and_then(|s| s.parse().ok()).unwrap_or(24);
     let layers: usize = std::env::var("LAYERS").ok().and_then(|s| s.parse().ok()).unwrap_or(1);
     let (bs, lr) = (64usize, 2e-3);
-    // CPU by default: the SSM's sequential scan is many tiny ops, so Metal's
-    // per-kernel launch overhead makes it ~2× SLOWER here (measured). DEVICE=metal
-    // to opt in anyway (only worth it for much wider/FFN-heavier configs).
-    let dev = if std::env::var("DEVICE").as_deref() == Ok("metal") {
-        Device::new_metal(0).unwrap_or(Device::Cpu)
-    } else {
-        Device::Cpu
-    };
-    println!("[lm] device={}", if dev.is_metal() { "metal(GPU)" } else { "cpu" });
+    // Portable device selection (builds anywhere; accelerators are opt-in cargo
+    // features so the default CPU build compiles on Kaggle/Linux, Mac, etc.):
+    //   default        → CPU
+    //   --features cuda → NVIDIA GPU (Kaggle, cloud)
+    //   --features metal→ Apple GPU (Mac)
+    #[cfg(feature = "cuda")]
+    let (dev, devname) = (Device::new_cuda(0).unwrap_or(Device::Cpu), "cuda(GPU)");
+    #[cfg(all(feature = "metal", not(feature = "cuda")))]
+    let (dev, devname) = (Device::new_metal(0).unwrap_or(Device::Cpu), "metal(GPU)");
+    #[cfg(not(any(feature = "cuda", feature = "metal")))]
+    let (dev, devname) = (Device::Cpu, "cpu");
+    println!("[lm] device={devname}");
     let dataset = std::env::var("DATASET").unwrap_or_else(|_| "arith".into());
     let mode = std::env::var("MODE").unwrap_or_else(|_| "sweep".into());
 
     // --- assemble corpus (+ vocab, + optional answer mask) ---
     let tok = std::env::var("TOKENIZER").unwrap_or_else(|_| "char".into());
-    let (corpus, vocab, amask): (Vec<u32>, usize, Vec<bool>) = if dataset == "text" || dataset == "distilled" {
-        let file = if dataset == "distilled" { "distilled.txt" } else { "tinyshakespeare.txt" };
+    let (corpus, vocab, amask): (Vec<u32>, usize, Vec<bool>) = if dataset == "text" || dataset == "distilled" || dataset == "fineweb" {
+        // fineweb.txt is produced by `vyoma-data` from a FineWeb parquet shard.
+        let file = match dataset.as_str() { "distilled" => "distilled.txt", "fineweb" => "fineweb.txt", _ => "tinyshakespeare.txt" };
         let dir = env!("CARGO_MANIFEST_DIR");
         let path = format!("{dir}/data_cache/{file}");
         let (s, v) = if tok == "bpe" {
