@@ -767,12 +767,28 @@ fn main() -> Result<()> {
         println!("[rag] retrieved (cos={sim:.3}, store mean {mean:.3}): {:?}",
                  &fetched.chars().take(90).collect::<String>());
 
-        let grounded = sim >= gate;
+        // Prefer the LEARNED head when given (HEAD=...): it reads the whole
+        // retrieval geometry [q ; e ; q⊙e] instead of one scalar, and measured
+        // 88.9% balanced accuracy held-out vs 74.0% for the cosine threshold.
+        let grounded = match std::env::var("HEAD").ok() {
+            Some(hp) => {
+                let head = vyoma_embed::GroundingHead::load(&hp, &dev)?;
+                let p = head.score(&q[0], &store_embs[hit], &dev)?;
+                let ok = p >= 0.5;
+                println!("[rag] learned head: P(supported)={p:.3} → {}", if ok { "ACCEPT" } else { "VETO" });
+                ok
+            }
+            None => {
+                let ok = sim >= gate;
+                println!("[rag] cosine gate (no HEAD=): cos {sim:.3} vs {gate} → {}", if ok { "ACCEPT" } else { "VETO" });
+                ok
+            }
+        };
         let full = if grounded {
-            println!("[rag] gate ACCEPTED (cos {sim:.3} ≥ {gate}) → grounding generation in retrieved context");
+            println!("[rag] grounding generation in retrieved context");
             format!("{fetched}\n{prompt}")
         } else {
-            println!("[rag] gate VETOED (cos {sim:.3} < {gate}) → store does not support this; generating ungrounded");
+            println!("[rag] store does not support this prompt → generating ungrounded (no hallucinated grounding)");
             prompt.clone()
         };
 

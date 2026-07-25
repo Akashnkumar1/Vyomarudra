@@ -352,6 +352,100 @@ pub fn load_store(path: &str) -> Result<(Vec<Vec<f32>>, Vec<Vec<u8>>)> {
     Ok((embs, records))
 }
 
+// ---------------------------------------------------------------------------
+// GroundingHead (Pillar 3b, learned) — decides "does the store actually support
+// this query?" from the FULL retrieval geometry, not a single cosine scalar.
+//
+// Why: a hand-set cosine threshold, even after training the retriever with
+// out-of-domain negatives, tops out at ~74% balanced accuracy because the
+// in/out-of-domain similarity distributions overlap (see docs/PROGRESS.md).
+// A scalar throws away almost everything the embeddings know. This small MLP
+// reads [q ; e ; q⊙e] — the query, the top match, and their interaction — so it
+// can use directions in the space, not just the angle between two vectors.
+// Trained on the same contrast (in-domain query = supported, foreign = not).
+// Ours, in Rust; no external model.
+// ---------------------------------------------------------------------------
+pub struct GroundingHead { w1: Var, b1: Var, w2: Var, b2: Var, pub dk: usize }
+
+impl GroundingHead {
+    pub fn new(dk: usize, hidden: usize, dev: &Device) -> Result<Self> {
+        let fin = 3 * dk;
+        Ok(Self {
+            w1: var_randn((fin, hidden), (1.0 / fin as f64).sqrt(), dev)?,
+            b1: var_randn1(hidden, 1e-6, dev)?,
+            w2: var_randn((hidden, 2), (1.0 / hidden as f64).sqrt(), dev)?,
+            b2: var_randn1(2, 1e-6, dev)?,
+            dk,
+        })
+    }
+    pub fn vars(&self) -> Vec<Var> { vec![self.w1.clone(), self.b1.clone(), self.w2.clone(), self.b2.clone()] }
+
+    /// Feature vector for one (query, top-match) pair: [q ; e ; q⊙e].
+    pub fn features(q: &[f32], e: &[f32]) -> Vec<f32> {
+        let mut f = Vec::with_capacity(3 * q.len());
+        f.extend_from_slice(q);
+        f.extend_from_slice(e);
+        f.extend(q.iter().zip(e).map(|(a, b)| a * b));
+        f
+    }
+    /// (B, 3dk) → (B, 2) logits [unsupported, supported].
+    pub fn forward(&self, feats: &Tensor) -> Result<Tensor> {
+        Ok(feats.matmul(self.w1.as_tensor())?.broadcast_add(self.b1.as_tensor())?.gelu()?
+            .matmul(self.w2.as_tensor())?.broadcast_add(self.b2.as_tensor())?)
+    }
+    /// P(supported) for one pair.
+    pub fn score(&self, q: &[f32], e: &[f32], dev: &Device) -> Result<f32> {
+        let f = Self::features(q, e);
+        let t = Tensor::from_vec(f, (1, 3 * self.dk), dev)?;
+        let p = candle_nn::ops::softmax(&self.forward(&t)?, D::Minus1)?.to_vec2::<f32>()?;
+        Ok(p[0][1])
+    }
+    pub fn save(&self, path: &str) -> Result<()> {
+        let mut m: std::collections::HashMap<String, Tensor> = std::collections::HashMap::new();
+        m.insert("w1".into(), self.w1.as_tensor().clone());
+        m.insert("b1".into(), self.b1.as_tensor().clone());
+        m.insert("w2".into(), self.w2.as_tensor().clone());
+        m.insert("b2".into(), self.b2.as_tensor().clone());
+        candle_core::safetensors::save(&m, path)?;
+        Ok(())
+    }
+    pub fn load(path: &str, dev: &Device) -> Result<Self> {
+        let t = candle_core::safetensors::load(path, dev)?;
+        let g = |k: &str| -> Result<Var> {
+            Ok(Var::from_tensor(&t.get(k).cloned().ok_or_else(|| anyhow::anyhow!("head ckpt missing `{k}`"))?)?)
+        };
+        let w1 = g("w1")?;
+        let dk = w1.dims2()?.0 / 3;
+        Ok(Self { w1, b1: g("b1")?, w2: g("w2")?, b2: g("b2")?, dk })
+    }
+}
+
+/// Train the grounding head. `feats`/`labels` are parallel: label 1 = the store
+/// supports this query, 0 = it does not. Returns (head, final loss).
+pub fn train_grounding_head(
+    feats: &[Vec<f32>], labels: &[u32], dk: usize, hidden: usize,
+    steps: usize, bsz: usize, lr: f64, dev: &Device, seed: u64,
+) -> Result<(GroundingHead, f32)> {
+    use rand::{Rng, SeedableRng};
+    anyhow::ensure!(feats.len() == labels.len() && !feats.is_empty(), "bad training set");
+    let head = GroundingHead::new(dk, hidden, dev)?;
+    let mut opt = AdamW::new(head.vars(), ParamsAdamW { lr, ..Default::default() })?;
+    let mut rng = StdRng::seed_from_u64(seed);
+    let fin = 3 * dk;
+    let mut last = 0f32;
+    for _ in 0..steps {
+        let idx: Vec<usize> = (0..bsz).map(|_| rng.gen_range(0..feats.len())).collect();
+        let flat: Vec<f32> = idx.iter().flat_map(|&i| feats[i].iter().cloned()).collect();
+        let y: Vec<u32> = idx.iter().map(|&i| labels[i]).collect();
+        let x = Tensor::from_vec(flat, (bsz, fin), dev)?;
+        let t = Tensor::from_vec(y, (bsz,), dev)?;
+        let loss = candle_nn::loss::cross_entropy(&head.forward(&x)?, &t)?;
+        opt.backward_step(&loss)?;
+        last = loss.to_scalar::<f32>()?;
+    }
+    Ok((head, last))
+}
+
 /// Retrieve the index of the nearest stored embedding to `query` (cosine).
 pub fn nearest(query: &[f32], store: &[Vec<f32>]) -> usize {
     let mut best = (0usize, f32::NEG_INFINITY);

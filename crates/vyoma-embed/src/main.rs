@@ -144,6 +144,83 @@ fn main() -> Result<()> {
         })
         .collect();
 
+    // -------- MODE=head: train the LEARNED grounding head (Pillar 3b) --------
+    // Replaces the hand-set cosine threshold (~74% balanced acc, overlapping
+    // distributions) with a small MLP over [q ; e ; q⊙e] — the whole retrieval
+    // geometry rather than one scalar. Evaluated on a HELD-OUT split so the
+    // number is honest. Env: NEG=<corpus> NCAL=<samples/class> HHID=<hidden>
+    if std::env::var("MODE").as_deref() == Ok("head") {
+        let encp = format!("{}/data_cache/retriever.safetensors", env!("CARGO_MANIFEST_DIR"));
+        let storep = format!("{}/data_cache/ontological_store.vyst", env!("CARGO_MANIFEST_DIR"));
+        let enc = vyoma_embed::Encoder::load(&encp, &dev)?;
+        let (embs, _recs) = load_store(&storep)?;
+        let ncal = env_usize("NCAL", 400);
+        let hidden = env_usize("HHID", 64);
+        let negf = std::env::var("NEG").map_err(|_| anyhow::anyhow!("MODE=head needs NEG=<corpus in vyoma-lm/data_cache>"))?;
+        println!("== MODE=head: learned grounding head (store={} facts, dk={}) ==", embs.len(), enc.dk);
+
+        // Build (features, label): in-domain query = supported(1), foreign = 0.
+        let mut feats: Vec<Vec<f32>> = Vec::new();
+        let mut labels: Vec<u32> = Vec::new();
+        let mut add = |text: &[u8], lab: u32, feats: &mut Vec<Vec<f32>>, labels: &mut Vec<u32>| -> Result<()> {
+            let q = &embed_all(&enc, &[text.to_vec()], &dev)?[0];
+            let hit = vyoma_embed::nearest(q, &embs);
+            feats.push(vyoma_embed::GroundingHead::features(q, &embs[hit]));
+            labels.push(lab);
+            Ok(())
+        };
+        // POSITIVES with a REALISTIC query distribution. Using only
+        // `center_fragment` (a fixed-offset verbatim slice) makes the head brittle:
+        // it then rejects a genuine in-domain prompt that differs in whitespace or
+        // framing (measured — a hand-typed prompt whose exact source passage was
+        // retrieved still scored P=0.406). Vary offset, length, and add light
+        // character noise so "supported" covers realistic phrasings, not one slice.
+        let mut pr = StdRng::seed_from_u64(4242);
+        for p in test.iter().take(ncal) {
+            let len = pr.gen_range(24..=QUERY_LEN.min(p.len()));
+            let off = pr.gen_range(0..=(p.len() - len));
+            let mut frag = p[off..off + len].to_vec();
+            if pr.gen::<f64>() < 0.5 {
+                let k = pr.gen_range(1..=3.min(frag.len()));
+                for _ in 0..k { let i = pr.gen_range(0..frag.len()); frag[i] = pr.gen_range(32..127u8); }
+            }
+            add(&frag, 1, &mut feats, &mut labels)?;
+        }
+        let negp = format!("{}/../vyoma-lm/data_cache/{negf}", env!("CARGO_MANIFEST_DIR"));
+        let nb = std::fs::read(&negp).map_err(|e| anyhow::anyhow!("NEG corpus {negp}: {e}"))?;
+        for c in nb.chunks(QUERY_LEN).filter(|c| c.len() == QUERY_LEN).take(ncal) {
+            add(c, 0, &mut feats, &mut labels)?;
+        }
+        println!("[head] dataset: {} samples ({} supported / {} not)", feats.len(),
+                 labels.iter().filter(|&&l| l == 1).count(), labels.iter().filter(|&&l| l == 0).count());
+
+        // interleave then split 80/20 so both classes appear in train and test
+        let mut order: Vec<usize> = (0..feats.len()).collect();
+        let mut r = StdRng::seed_from_u64(31);
+        for i in (1..order.len()).rev() { let j = r.gen_range(0..=i); order.swap(i, j); }
+        let cut = order.len() * 8 / 10;
+        let (tr, te) = order.split_at(cut);
+        let trf: Vec<Vec<f32>> = tr.iter().map(|&i| feats[i].clone()).collect();
+        let trl: Vec<u32> = tr.iter().map(|&i| labels[i]).collect();
+
+        let (head, loss) = vyoma_embed::train_grounding_head(&trf, &trl, enc.dk, hidden, 1500, 64, 1e-3, &dev, 7)?;
+        // held-out balanced accuracy
+        let (mut tp, mut np1, mut tn, mut nn) = (0usize, 0usize, 0usize, 0usize);
+        for &i in te {
+            let p = head.score(&feats[i][..enc.dk], &feats[i][enc.dk..2 * enc.dk], &dev)?;
+            let pred = if p >= 0.5 { 1u32 } else { 0 };
+            if labels[i] == 1 { np1 += 1; if pred == 1 { tp += 1; } } else { nn += 1; if pred == 0 { tn += 1; } }
+        }
+        let (tpr, tnr) = (tp as f32 / np1.max(1) as f32, tn as f32 / nn.max(1) as f32);
+        println!("[head] trained (loss {loss:.3}) — HELD-OUT: balanced acc {:.1}% (accepts {:.1}% supported, rejects {:.1}% unsupported)",
+                 (tpr + tnr) * 50.0, tpr * 100.0, tnr * 100.0);
+        println!("[head] baseline for comparison: hand-set cosine threshold = 74.0% balanced acc");
+        let hp = format!("{}/data_cache/grounding_head.safetensors", env!("CARGO_MANIFEST_DIR"));
+        head.save(&hp)?;
+        println!("[head] saved -> {hp}  (use: MODE=rag HEAD={hp})");
+        return Ok(());
+    }
+
     // -------- MODE=gate: does the retriever know what it does NOT know? --------
     // Directly measures the grounding signal the RAG gate depends on: for probes
     // from several domains, how far above the store's own similarity distribution
