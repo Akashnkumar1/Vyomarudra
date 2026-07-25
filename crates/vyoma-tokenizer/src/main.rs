@@ -7,10 +7,15 @@
 //! external dependency (no teacher, no library).
 //!
 //! Run:  DATASET=text VOCAB=512 ./target/release/vyoma-tokenizer
-//! Env:  DATASET (text|distilled), VOCAB (target vocab size, ≥257).
+//! Env:  DATASET (text|distilled|fineweb), VOCAB (target vocab size, ≥257),
+//!       SAMPLE_MB (train merges on this many MB of the corpus, default 20 —
+//!       training cost scales with UNIQUE words seen, not total corpus size, but
+//!       a cap keeps it bounded on very large corpora like FineWeb; the learned
+//!       merges are then reused to BPE-encode the FULL corpus by `vyoma-lm`).
 
 use anyhow::{Context, Result};
 use std::collections::HashMap;
+use std::io::Read;
 
 /// Split bytes into "words": each whitespace byte starts a new word (kept as its
 /// first byte), so concatenating all words reproduces the input exactly (reversible),
@@ -102,11 +107,19 @@ impl Bpe {
 fn main() -> Result<()> {
     let dataset = std::env::var("DATASET").unwrap_or_else(|_| "text".into());
     let vocab: usize = std::env::var("VOCAB").ok().and_then(|s| s.parse().ok()).unwrap_or(512);
-    let file = if dataset == "distilled" { "distilled.txt" } else { "tinyshakespeare.txt" };
+    let sample_mb: usize = std::env::var("SAMPLE_MB").ok().and_then(|s| s.parse().ok()).unwrap_or(20);
+    let file = match dataset.as_str() {
+        "distilled" => "distilled.txt",
+        "fineweb" => "fineweb.txt",
+        _ => "tinyshakespeare.txt",
+    };
     let path = format!("{}/../vyoma-lm/data_cache/{file}", env!("CARGO_MANIFEST_DIR"));
-    let bytes = std::fs::read(&path).with_context(|| format!("need corpus at {path}"))?;
+    let full_len = std::fs::metadata(&path).with_context(|| format!("need corpus at {path}"))?.len();
+    let cap = (sample_mb as u64).saturating_mul(1024 * 1024);
+    let mut bytes = Vec::new();
+    std::fs::File::open(&path)?.take(cap).read_to_end(&mut bytes)?;
     let num_merges = vocab.saturating_sub(256);
-    println!("[bpe] corpus={} ({} bytes)  target vocab={vocab} ({num_merges} merges)", file, bytes.len());
+    println!("[bpe] corpus={file} (training on {} of {full_len} bytes, cap={sample_mb}MB)  target vocab={vocab} ({num_merges} merges)", bytes.len());
 
     // dedup words → (word, freq)
     let mut wf: HashMap<Vec<u32>, usize> = HashMap::new();
