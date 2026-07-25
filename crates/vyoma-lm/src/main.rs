@@ -363,6 +363,157 @@ fn eval_bpb(stream: &[u32], blens: &[u32], st: &Stored, ffn: &Tensor, c: &Cfg, l
     Ok(bits / bytes)
 }
 
+// ---------------------------------------------------------------------------
+// Pillar 3 — sparse Mixture-of-Experts FFN (ours). E expert FFNs + a gate that
+// routes each token to its top-1 expert. Capacity scales with E; active compute
+// stays ~one expert. This is exactly the "large redundant FFN mass" regime where
+// generation earns its keep (Pillar 1) — experts are the natural thing to generate.
+// (Toy note: we compute all experts and select, so FLOPs here are dense; a
+// production impl gathers per-expert. The routing/quality behavior is faithful.)
+// ---------------------------------------------------------------------------
+struct Expert { w1: Var, b1: Var, w2: Var, b2: Var }
+impl Expert {
+    fn new(dm: usize, dff: usize, dev: &Device) -> Result<Self> {
+        Ok(Self {
+            w1: var_randn((dff, dm), (1.0 / dm as f64).sqrt(), dev)?,
+            b1: var_randn1(dff, 0.01, dev)?,
+            w2: var_randn((dm, dff), (1.0 / dff as f64).sqrt(), dev)?,
+            b2: var_randn1(dm, 0.01, dev)?,
+        })
+    }
+    fn vars(&self) -> Vec<Var> { vec![self.w1.clone(), self.b1.clone(), self.w2.clone(), self.b2.clone()] }
+    fn apply(&self, y: &Tensor) -> Result<Tensor> { // (N,dm) -> (N,dm)
+        Ok(y.matmul(&self.w1.as_tensor().t()?)?.broadcast_add(self.b1.as_tensor())?.gelu()?
+            .matmul(&self.w2.as_tensor().t()?)?.broadcast_add(self.b2.as_tensor())?)
+    }
+}
+struct Moe { gate: Var, experts: Vec<Expert> }
+impl Moe {
+    fn new(dm: usize, dff: usize, e: usize, dev: &Device) -> Result<Self> {
+        Ok(Self {
+            gate: var_randn((dm, e), (1.0 / dm as f64).sqrt(), dev)?,
+            experts: (0..e).map(|_| Expert::new(dm, dff, dev)).collect::<Result<_>>()?,
+        })
+    }
+    fn vars(&self) -> Vec<Var> {
+        let mut v = vec![self.gate.clone()];
+        for e in &self.experts { v.extend(e.vars()); }
+        v
+    }
+    fn n_params(&self) -> usize { self.vars().iter().map(|v| v.elem_count()).sum() }
+    fn expert_params(&self) -> usize { self.experts[0].vars().iter().map(|v| v.elem_count()).sum() }
+}
+
+/// MoE forward. Returns (logits (B*L,vocab), load-balance aux loss scalar).
+fn forward_moe(ids: &Tensor, st: &Stored, moe: &Moe, dm: usize, dev: &Device) -> Result<(Tensor, Tensor)> {
+    let (b, l) = ids.dims2()?;
+    let flat = ids.reshape((b * l,))?;
+    let hseq = st.embed.as_tensor().index_select(&flat, 0)?.reshape((b, l, dm))?;
+    let y = ssm_layer(&hseq, &st.ssm[0], b, l, dm, dev)?.reshape((b * l, dm))?; // (N,dm)
+    let gl = y.matmul(moe.gate.as_tensor())?;                 // (N,E)
+    let gp = candle_nn::ops::softmax(&gl, D::Minus1)?;        // (N,E)
+    let (n, e) = gp.dims2()?;
+    let maxp = gp.max_keepdim(D::Minus1)?.broadcast_as((n, e))?;
+    let mask = gp.eq(&maxp)?.to_dtype(DType::F32)?;           // (N,E) top-1 one-hot
+    let w = gp.mul(&mask)?;                                   // (N,E) chosen expert's prob
+    let mut out = Tensor::zeros((n, dm), DType::F32, dev)?;
+    for ei in 0..e {
+        let ff = moe.experts[ei].apply(&y)?;                  // (N,dm)
+        out = (out + ff.broadcast_mul(&w.narrow(1, ei, 1)?)?)?;
+    }
+    let h = (y + out)?;                                       // residual
+    let logits = h.matmul(&st.wo.as_tensor().t()?)?.broadcast_add(st.bo.as_tensor())?;
+    // Switch-style load balance: E · Σ_e f_e · P_e  (minimized ⇒ balanced routing)
+    let aux = (mask.mean(0)?.mul(&gp.mean(0)?)?.sum_all()? * e as f64)?;
+    Ok((logits, aux))
+}
+
+/// Per-tensor symmetric fake-quantization of trained weights (offline, no grad):
+/// pull to f32, quantize to `bits`, rebuild. For the capability-per-RAM benchmark.
+fn fake_quant_vec(flat: &[f32], bits: u32) -> Vec<f32> {
+    let maxabs = flat.iter().fold(0f32, |m, &x| m.max(x.abs()));
+    if maxabs == 0.0 { return flat.to_vec(); }
+    let levels = ((1u32 << (bits - 1)) - 1) as f32;
+    let scale = maxabs / levels;
+    flat.iter().map(|&x| (x / scale).round().clamp(-levels, levels) * scale).collect()
+}
+fn quantized(t: &Tensor, bits: u32, dev: &Device) -> Result<Tensor> {
+    let v = t.flatten_all()?.to_vec1::<f32>()?;
+    Ok(Tensor::from_vec(fake_quant_vec(&v, bits), t.dims().to_vec(), dev)?)
+}
+
+/// GENERATED MoE forward (Pillar 1 × Pillar 3): the E experts' weights come from a
+/// flat tensor produced by a fractal seed (`ex_flat`, length E·expert_params); the
+/// gate is stored (tiny). Same top-1 routing. Returns (logits, load-balance aux).
+fn forward_moe_gen(ids: &Tensor, st: &Stored, gate: &Tensor, ex_flat: &Tensor, dm: usize, dff: usize, e: usize, dev: &Device) -> Result<(Tensor, Tensor)> {
+    let (b, l) = ids.dims2()?;
+    let flat = ids.reshape((b * l,))?;
+    let hseq = st.embed.as_tensor().index_select(&flat, 0)?.reshape((b, l, dm))?;
+    let y = ssm_layer(&hseq, &st.ssm[0], b, l, dm, dev)?.reshape((b * l, dm))?;
+    let gp = candle_nn::ops::softmax(&y.matmul(gate)?, D::Minus1)?;   // (N,E)
+    let (n, _) = gp.dims2()?;
+    let maxp = gp.max_keepdim(D::Minus1)?.broadcast_as((n, e))?;
+    let mask = gp.eq(&maxp)?.to_dtype(DType::F32)?;
+    let w = gp.mul(&mask)?;
+    let per = 2 * dm * dff + dff + dm;
+    let mut out = Tensor::zeros((n, dm), DType::F32, dev)?;
+    for ei in 0..e {
+        let mut o = ei * per;
+        let w1 = ex_flat.narrow(0, o, dff * dm)?.reshape((dff, dm))?; o += dff * dm;
+        let b1 = ex_flat.narrow(0, o, dff)?; o += dff;
+        let w2 = ex_flat.narrow(0, o, dm * dff)?.reshape((dm, dff))?; o += dm * dff;
+        let b2 = ex_flat.narrow(0, o, dm)?;
+        let ff = y.matmul(&w1.t()?)?.broadcast_add(&b1)?.gelu()?.matmul(&w2.t()?)?.broadcast_add(&b2)?;
+        out = (out + ff.broadcast_mul(&w.narrow(1, ei, 1)?)?)?;
+    }
+    let h = (y + out)?;
+    let logits = h.matmul(&st.wo.as_tensor().t()?)?.broadcast_add(st.bo.as_tensor())?;
+    let aux = (mask.mean(0)?.mul(&gp.mean(0)?)?.sum_all()? * e as f64)?;
+    Ok((logits, aux))
+}
+
+fn eval_bpb_moe_gen(stream: &[u32], blens: &[u32], st: &Stored, gate: &Tensor, ex_flat: &Tensor, dm: usize, dff: usize, e: usize, l: usize, dev: &Device) -> Result<f64> {
+    let (mut bits, mut bytes, mut cnt) = (0f64, 0f64, 0usize);
+    let mut e0 = 0;
+    while cnt < 4000 && e0 + l + 1 <= stream.len() {
+        let ids = Tensor::from_vec(stream[e0..e0 + l].to_vec(), (1, l), dev)?;
+        let rows = forward_moe_gen(&ids, st, gate, ex_flat, dm, dff, e, dev)?.0.to_vec2::<f32>()?;
+        for t in 0..l {
+            if cnt >= 4000 { break; }
+            let truth = stream[e0 + t + 1] as usize;
+            let row = &rows[t];
+            let m = row.iter().cloned().fold(f32::MIN, f32::max);
+            let lse = m + row.iter().map(|v| (v - m).exp()).sum::<f32>().ln();
+            bits += (-(row[truth] - lse) as f64) / std::f64::consts::LN_2;
+            bytes += blens[e0 + t + 1] as f64;
+            cnt += 1;
+        }
+        e0 += l;
+    }
+    Ok(bits / bytes)
+}
+
+fn eval_bpb_moe(stream: &[u32], blens: &[u32], st: &Stored, moe: &Moe, dm: usize, l: usize, dev: &Device) -> Result<f64> {
+    let (mut bits, mut bytes, mut cnt) = (0f64, 0f64, 0usize);
+    let mut e0 = 0;
+    while cnt < 4000 && e0 + l + 1 <= stream.len() {
+        let ids = Tensor::from_vec(stream[e0..e0 + l].to_vec(), (1, l), dev)?;
+        let rows = forward_moe(&ids, st, moe, dm, dev)?.0.to_vec2::<f32>()?;
+        for t in 0..l {
+            if cnt >= 4000 { break; }
+            let truth = stream[e0 + t + 1] as usize;
+            let row = &rows[t];
+            let m = row.iter().cloned().fold(f32::MIN, f32::max);
+            let lse = m + row.iter().map(|v| (v - m).exp()).sum::<f32>().ln();
+            bits += (-(row[truth] - lse) as f64) / std::f64::consts::LN_2;
+            bytes += blens[e0 + t + 1] as f64;
+            cnt += 1;
+        }
+        e0 += l;
+    }
+    Ok(bits / bytes)
+}
+
 /// Returns (loss, overall next-char acc, ANSWER-digit acc). The last is the one
 /// that measures whether the model learned to add.
 fn eval_loss_acc(stream: &[u32], amask: &[bool], st: &Stored, ffn: &Tensor, c: &Cfg, l: usize, dev: &Device) -> Result<(f64, f64, f64)> {
@@ -390,6 +541,32 @@ fn eval_loss_acc(stream: &[u32], amask: &[bool], st: &Stored, ffn: &Tensor, c: &
         count += b;
     }
     Ok((tot_loss / count as f64, correct / (count * l) as f64, ans_correct / ans_count.max(1.0)))
+}
+
+/// Bits-per-char over MASKED (target) positions only — the retrieval-conditioned
+/// language-modeling metric. Char-level ⇒ bits/char = bits/byte on those positions.
+fn eval_bpb_masked(stream: &[u32], amask: &[bool], st: &Stored, ffn: &Tensor, c: &Cfg, l: usize, dev: &Device) -> Result<f64> {
+    let mut starts: Vec<usize> = (0..).map(|k| k * l).take_while(|&s| s + l + 1 <= stream.len()).collect();
+    starts.truncate(400);
+    let (mut nll_bits, mut cnt) = (0f64, 0f64);
+    for chunk in starts.chunks(64) {
+        let b = chunk.len();
+        let (mut xin, mut xtg, mut xmask) = (Vec::new(), Vec::new(), Vec::new());
+        for &s in chunk {
+            xin.extend_from_slice(&stream[s..s + l]);
+            xtg.extend_from_slice(&stream[s + 1..s + l + 1]);
+            for t in 0..l { xmask.push(if amask[s + t + 1] { 1f32 } else { 0f32 }); }
+        }
+        let ids = Tensor::from_vec(xin, (b, l), dev)?;
+        let tgt = Tensor::from_vec(xtg, (b * l, 1), dev)?;
+        let logits = forward(&ids, st, ffn, c)?;
+        let lp = candle_nn::ops::log_softmax(&logits, D::Minus1)?;
+        let picked = lp.gather(&tgt, 1)?;                // (b*l, 1) log p(target), nats
+        let mask = Tensor::from_vec(xmask.clone(), (b * l, 1), dev)?;
+        nll_bits += picked.neg()?.mul(&mask)?.sum_all()?.to_scalar::<f32>()? as f64;
+        cnt += xmask.iter().sum::<f32>() as f64;
+    }
+    Ok(nll_bits / cnt.max(1.0) / std::f64::consts::LN_2)
 }
 
 fn train<F>(vars: Vec<Var>, ffn_of: &F, train_s: &[u32], test_s: &[u32], test_mask: &[bool], st: &Stored, c: &Cfg,
@@ -493,6 +670,565 @@ fn main() -> Result<()> {
             println!("{line}");
         }
         println!("[lm] done (kv). If memorize collapses as facts grow but retrieve stays flat → knowledge belongs on disk, not in weights.");
+        return Ok(());
+    }
+
+    // --- MODE=retro: E2 closed with a REAL retriever (ours), not the oracle. ---
+    // Our vyoma-embed encoder fetches the fact from a store; our SSM LM reads the
+    // fetched value and answers. End-to-end accuracy = our retriever's quality ×
+    // the LM's (trivial) copy. Compare to memorize (LM alone), sweep #facts.
+    // Entirely ours: our retriever + our LM + our store. No teacher anywhere.
+    if mode == "retro" {
+        let n_val = 10usize;
+        let ev = |k: &str, d: usize| std::env::var(k).ok().and_then(|s| s.parse().ok()).unwrap_or(d);
+        // Tunable retriever (the "keep growing" lever): longer keys + bigger dk stay
+        // separable as facts grow → retro flat-high. Env: RD, RDK, RDM, RSTEPS, RNS.
+        let d_key = ev("RD", 12);        // key length in digits
+        let (rdm, rdk, rsteps) = (ev("RDM", 96), ev("RDK", 256), ev("RSTEPS", 2500));
+        let key_bytes = |e: usize| -> Vec<u8> { format!("{e:0width$}", width = d_key).into_bytes() };
+        let n_list: Vec<usize> = match std::env::var("RNS").ok() {
+            Some(s) => s.split(',').filter_map(|x| x.trim().parse().ok()).collect(),
+            None => vec![500, 2000, 8000],
+        };
+        println!("[lm] RETRO-lite — our retriever (d={rdm}, dk={rdk}, {rsteps} steps, {d_key}-digit keys) fetches; our LM reads & answers.");
+        println!("[lm] memorize vs retro(ours), sweep facts. dm={dm} dff={dff}");
+        for &n_ent in &n_list {
+            let mut rng = StdRng::seed_from_u64(100 + n_ent as u64);
+            let val_of: Vec<u32> = (0..n_ent).map(|_| rng.gen_range(0..n_val) as u32).collect();
+
+            // Train OUR retriever: noisy key → clean key record. Then encode the store.
+            let (enc, _rl) = vyoma_embed::train_encoder(
+                rdm, rdk, 1, rsteps, 128, 1e-3, 0.05, &dev, 7 + n_ent as u64,
+                |r: &mut StdRng| {
+                    let e = r.gen_range(0..n_ent);
+                    let clean = key_bytes(e);
+                    let mut q = clean.clone();
+                    let pos = r.gen_range(0..q.len());
+                    q[pos] = b'0' + r.gen_range(0..10u8);
+                    (q, clean)
+                },
+            )?;
+            let recs: Vec<Vec<u8>> = (0..n_ent).map(&key_bytes).collect();
+            let store = vyoma_embed::embed_all(&enc, &recs, &dev)?;
+
+            // Retrieve ONCE per entity (O(N²·dk), not O(n_ex·N·dk)) so we can scale facts.
+            let mut ers = StdRng::seed_from_u64(9 + n_ent as u64);
+            let e_queries: Vec<Vec<u8>> = (0..n_ent).map(|e| {
+                let mut q = key_bytes(e);
+                let pos = ers.gen_range(0..q.len());
+                q[pos] = b'0' + ers.gen_range(0..10u8);
+                q
+            }).collect();
+            let qembs = vyoma_embed::embed_all(&enc, &e_queries, &dev)?;
+            let retrieved: Vec<usize> = qembs.iter().map(|q| vyoma_embed::nearest(q, &store)).collect();
+            let ret_acc = retrieved.iter().enumerate().filter(|(e, r)| **r == *e).count() as f64 / n_ent as f64;
+            let rv_of: Vec<u32> = retrieved.iter().map(|&r| val_of[r]).collect(); // value our retriever fetches for e
+
+            // Build the retro corpus: [clean key digits][our-retrieved value][QMARK][true value*][NL].
+            let (qmark, nl, kvocab) = (10u32, 11u32, 12usize);
+            let digits = |mut x: usize| -> Vec<u32> { let mut v = vec![0u32; d_key]; for i in (0..d_key).rev() { v[i] = (x % 10) as u32; x /= 10; } v };
+            let n_ex = (20 * n_ent).max(8000);
+            let mut crng = StdRng::seed_from_u64(21 + n_ent as u64);
+            let (mut s, mut m) = (Vec::new(), Vec::new());
+            for _ in 0..n_ex {
+                let e = crng.gen_range(0..n_ent);
+                let v = val_of[e];
+                let rv = rv_of[e]; // value carried by the fact OUR retriever fetched for e
+                for d in digits(e) { s.push(d); m.push(false); }
+                s.push(rv); m.push(false); // fetched value, adjacent (wrong if retrieval missed)
+                s.push(qmark); m.push(false);
+                s.push(v); m.push(true); // answer (scored): the TRUE value
+                s.push(nl); m.push(false);
+            }
+            let split = s.len() * 9 / 10;
+
+            // Train the LM to read the fetched value and answer.
+            let cc = Cfg { dm, dff, layers };
+            let st = Stored::new(&cc, kvocab, &dev)?;
+            let ffn = { let np = ffn_total(&cc); let noise = Tensor::randn(0f32, 1f32, (np,), &dev)?; Var::from_tensor(&noise.mul(&Tensor::from_vec(ffn_prior(&cc), (np,), &dev)?)?)? };
+            let ffn_c = ffn.clone();
+            let mut vars = st.vars(); vars.push(ffn.clone());
+            let (_l, _o, retro_acc) = train(vars, &|| Ok(ffn_c.as_tensor().clone()),
+                &s[..split], &s[split..], &m[split..], &st, &cc, steps, l, bs, lr, 0, &dev)?;
+
+            // Memorize baseline: LM alone (no fetched value), same #facts and key encoding.
+            let (mut mc, mut mm) = (Vec::new(), Vec::new());
+            let mut mrng = StdRng::seed_from_u64(7 + n_ent as u64);
+            for _ in 0..n_ex {
+                let e = mrng.gen_range(0..n_ent);
+                let v = val_of[e];
+                for d in digits(e) { mc.push(d); mm.push(false); }
+                mc.push(qmark); mm.push(false);
+                mc.push(v); mm.push(true);
+                mc.push(nl); mm.push(false);
+            }
+            let msplit = mc.len() * 9 / 10;
+            let stm = Stored::new(&cc, kvocab, &dev)?;
+            let ffnm = { let np = ffn_total(&cc); let noise = Tensor::randn(0f32, 1f32, (np,), &dev)?; Var::from_tensor(&noise.mul(&Tensor::from_vec(ffn_prior(&cc), (np,), &dev)?)?)? };
+            let ffnm_c = ffnm.clone();
+            let mut vm = stm.vars(); vm.push(ffnm.clone());
+            let (_l2, _o2, mem_acc) = train(vm, &|| Ok(ffnm_c.as_tensor().clone()),
+                &mc[..msplit], &mc[msplit..], &mm[msplit..], &stm, &cc, steps, l, bs, lr, 0, &dev)?;
+
+            println!("[lm]  facts={n_ent:5}  memorize={mem_acc:.3}  retro(ours)={retro_acc:.3}  [our-retriever hit-rate={ret_acc:.3}]");
+        }
+        println!("[lm] done (retro). memorize collapses as facts grow; retro(ours) stays ~ retriever hit-rate → capability decoupled from model size, with OUR retriever closing the loop (E2 was oracle). No teacher.");
+        return Ok(());
+    }
+
+    // --- MODE=retrolm: the retro loop on REAL language. Each block is
+    // [neighbor][SEP][passage]; the LM predicts the passage chars. Ablation:
+    // retro (neighbor = OUR retriever's nearest passage) vs baseline (neighbor =
+    // a RANDOM passage). Same architecture / context length — the only difference
+    // is whether the prepended context is retrieval-selected. Scored by masked
+    // next-char accuracy AND masked bits/char on held-out text. Entirely ours.
+    if mode == "retrolm" {
+        let ev = |k: &str, d: usize| std::env::var(k).ok().and_then(|s| s.parse().ok()).unwrap_or(d);
+        let p_len = ev("RP", 32);          // passage/chunk length in bytes
+        let seq = ev("RSEQ", 64);          // block/window length (LM context)
+        let n_pre = seq - p_len - 1;       // neighbor chars prepended (n_pre + 1 SEP + p_len = seq)
+        let n_seeds = ev("RSEEDS", 2);     // ≥2 seeds to bound variance
+        let max_train = 6000usize;
+        let max_test = 1500usize;
+
+        let path = format!("{}/data_cache/tinyshakespeare.txt", env!("CARGO_MANIFEST_DIR"));
+        let raw = std::fs::read(&path)?;
+        // char map (byte -> id); SEP = the extra id V
+        let mut seen = [false; 256];
+        for &b in &raw { seen[b as usize] = true; }
+        let mut cmap = [0u32; 256];
+        let mut v = 0u32;
+        for i in 0..256 { if seen[i] { cmap[i] = v; v += 1; } }
+        let sep = v; let rvocab = (v + 1) as usize;
+        let pass_bytes: Vec<Vec<u8>> = raw.chunks(p_len).filter(|c| c.len() == p_len).map(|c| c.to_vec()).collect();
+        let n_tr = (pass_bytes.len() * 8 / 10).min(max_train);
+        let te_start = pass_bytes.len() * 8 / 10;
+        let n_te = (pass_bytes.len() - te_start).min(max_test);
+        let tr_b = &pass_bytes[..n_tr];
+        let te_b = &pass_bytes[te_start..te_start + n_te];
+        println!("[lm] RETRO-LM (real text): block=[neighbor {n_pre}][SEP][passage {p_len}], seq={seq}, vocab={rvocab}");
+        println!("[lm]   train passages={n_tr} test passages={n_te}. Ablation: retrieved-neighbor vs random-neighbor.");
+
+        // Our retriever over passages (fragment → passage), then store embeddings.
+        let (enc, _rl) = vyoma_embed::train_encoder(
+            96, 256, 1, 2000, 128, 1e-3, 0.05, &dev, 4242,
+            |r: &mut StdRng| {
+                let p = &tr_b[r.gen_range(0..tr_b.len())];
+                let off = r.gen_range(0..=(p_len - p_len.min(20)));
+                (p[off..(off + p_len.min(20)).min(p.len())].to_vec(), p.clone())
+            },
+        )?;
+        let store = vyoma_embed::embed_all(&enc, tr_b, &dev)?;
+        let tr_emb = store.clone();
+        let te_emb = vyoma_embed::embed_all(&enc, te_b, &dev)?;
+
+        // nearest OTHER train passage (exclude self) for each train passage.
+        let nearest_excl = |q: &[f32], skip: usize| -> usize {
+            let mut best = (usize::MAX, f32::NEG_INFINITY);
+            for (j, e) in store.iter().enumerate() {
+                if j == skip { continue; }
+                let s: f32 = q.iter().zip(e).map(|(a, b)| a * b).sum();
+                if s > best.1 { best = (j, s); }
+            }
+            best.0
+        };
+        let tr_neighbor: Vec<usize> = (0..n_tr).map(|i| nearest_excl(&tr_emb[i], i)).collect();
+        let te_neighbor: Vec<usize> = (0..n_te).map(|i| vyoma_embed::nearest(&te_emb[i], &store)).collect();
+
+        // Build a flat stream of [neighbor][SEP][passage] blocks; mask marks the
+        // passage (target) positions. `use_retrieved`: neighbor = retriever's pick,
+        // else a random train passage. Returns (stream, mask).
+        let ids_of = |bytes: &[u8]| -> Vec<u32> { bytes.iter().map(|&b| cmap[b as usize]).collect() };
+        let build = |idxs: &[usize], neigh: &[usize], use_retrieved: bool, seed: u64| -> (Vec<u32>, Vec<bool>) {
+            let mut rng = StdRng::seed_from_u64(seed);
+            let (mut s, mut m) = (Vec::new(), Vec::new());
+            for (k, &i) in idxs.iter().enumerate() {
+                let nb = if use_retrieved { neigh[k] } else { rng.gen_range(0..n_tr) };
+                for &t in ids_of(&tr_b[nb]).iter().take(n_pre) { s.push(t); m.push(false); }
+                s.push(sep); m.push(false);
+                for &t in &ids_of(&pass_bytes[i]) { s.push(t); m.push(true); }
+            }
+            (s, m)
+        };
+        let tr_idx: Vec<usize> = (0..n_tr).collect();
+        let te_idx: Vec<usize> = (te_start..te_start + n_te).collect();
+
+        let run = |use_retrieved: bool, seed: u64| -> Result<(f64, f64)> {
+            let (s_tr, _m_tr) = build(&tr_idx, &tr_neighbor, use_retrieved, seed * 2 + 1);
+            let (s_te, m_te) = build(&te_idx, &te_neighbor, use_retrieved, seed * 2 + 2);
+            let cc = Cfg { dm, dff, layers };
+            let st = Stored::new(&cc, rvocab, &dev)?;
+            let ffn = { let np = ffn_total(&cc); let noise = Tensor::randn(0f32, 1f32, (np,), &dev)?; Var::from_tensor(&noise.mul(&Tensor::from_vec(ffn_prior(&cc), (np,), &dev)?)?)? };
+            let ffn_c = ffn.clone();
+            let mut vars = st.vars(); vars.push(ffn.clone());
+            let (_ls, _ov, acc) = train(vars, &|| Ok(ffn_c.as_tensor().clone()), &s_tr, &s_te, &m_te, &st, &cc, steps, seq, bs, lr, seed, &dev)?;
+            let bpb = eval_bpb_masked(&s_te, &m_te, &st, &ffn_c.as_tensor().clone(), &cc, seq, &dev)?;
+            Ok((acc, bpb))
+        };
+        let mean_std = |v: &[f64]| -> (f64, f64) {
+            let m = v.iter().sum::<f64>() / v.len() as f64;
+            let sd = (v.iter().map(|x| (x - m).powi(2)).sum::<f64>() / v.len() as f64).sqrt();
+            (m, sd)
+        };
+        let (mut r_bpb, mut x_bpb, mut r_acc, mut x_acc) = (vec![], vec![], vec![], vec![]);
+        for sd in 0..n_seeds as u64 {
+            let (ra, rb) = run(true, sd)?;
+            let (xa, xb) = run(false, sd)?;
+            r_acc.push(ra); r_bpb.push(rb); x_acc.push(xa); x_bpb.push(xb);
+            println!("[lm]   seed {sd}: retro bits/char {rb:.3} (acc {ra:.3}) | random {xb:.3} (acc {xa:.3}) | Δbits {:+.3}", rb - xb);
+        }
+        let (rbm, rbs) = mean_std(&r_bpb);
+        let (xbm, xbs) = mean_std(&x_bpb);
+        let (ram, _) = mean_std(&r_acc);
+        let (xam, _) = mean_std(&x_acc);
+        println!("[lm]  RETRO-LM over {n_seeds} seeds — retro bits/char {rbm:.3}±{rbs:.3}  random {xbm:.3}±{xbs:.3}");
+        println!("[lm]  Δbits/char = {:+.3} (retro − random),  Δacc = {:+.3}", rbm - xbm, ram - xam);
+        println!("[lm] done (retrolm). retro < random on bits/char ⇒ OUR retriever selects passages that help predict real held-out text. No teacher.");
+        return Ok(());
+    }
+
+    // --- MODE=moe: Pillar 3 — sparse Mixture-of-Experts. Does routing to top-1 of
+    // E experts (dff each) buy dense-big (dff=E·dff) capacity at dense-small
+    // (dff) active compute? Scored by bits-per-byte on real text. Ours, no teacher.
+    if mode == "moe" {
+        let e_n: usize = std::env::var("MOE_E").ok().and_then(|s| s.parse().ok()).unwrap_or(4);
+        let merges_path = format!("{}/data_cache/bpe_merges.txt", env!("CARGO_MANIFEST_DIR"));
+        let blens = token_byte_lengths(&corpus, &tok, &merges_path)?;
+        let tb = &blens[split..];
+        println!("[lm] MODE=moe (Pillar 3) [{tok}]: dense-small(dff={dff}) vs MoE({e_n} experts × dff={dff}, top-1) vs dense-big(dff={})", e_n * dff);
+
+        // dense-small: single FFN, dff.
+        let cs = Cfg { dm, dff, layers: 1 };
+        let sts = Stored::new(&cs, vocab, &dev)?;
+        let ffs = { let np = ffn_total(&cs); let noise = Tensor::randn(0f32, 1f32, (np,), &dev)?; Var::from_tensor(&noise.mul(&Tensor::from_vec(ffn_prior(&cs), (np,), &dev)?)?)? };
+        let ffs_c = ffs.clone();
+        let mut vs = sts.vars(); vs.push(ffs.clone());
+        train(vs, &|| Ok(ffs_c.as_tensor().clone()), train_s, test_s, test_mask, &sts, &cs, steps, l, bs, lr, 0, &dev)?;
+        let bpb_small = eval_bpb(test_s, tb, &sts, ffs_c.as_tensor(), &cs, l, &dev)?;
+        let p_small = sts.n_params() + ffs_c.as_tensor().elem_count();
+
+        // MoE: E experts of dff, top-1 routing + load-balance aux.
+        let cm = Cfg { dm, dff, layers: 1 };
+        let stm = Stored::new(&cm, vocab, &dev)?;
+        let moe = Moe::new(dm, dff, e_n, &dev)?;
+        let mut vm = stm.vars(); vm.extend(moe.vars());
+        let mut opt = AdamW::new(vm, ParamsAdamW { lr, ..Default::default() })?;
+        let mut rng = StdRng::seed_from_u64(0);
+        for _ in 0..steps {
+            let (ids, tg) = sample_batch(train_s, bs, l, &mut rng, &dev)?;
+            let (logits, aux) = forward_moe(&ids, &stm, &moe, dm, &dev)?;
+            let ce = candle_nn::loss::cross_entropy(&logits, &tg.reshape((bs * l,))?)?;
+            let loss = (ce + (aux * 0.01)?)?;
+            opt.backward_step(&loss)?;
+        }
+        let bpb_moe = eval_bpb_moe(test_s, tb, &stm, &moe, dm, l, &dev)?;
+        let p_moe_total = stm.n_params() + moe.n_params();
+        let p_moe_active = stm.n_params() + moe.expert_params() + dm * e_n; // ~one expert + gate
+
+        // dense-big: single FFN, E·dff (the capacity upper bound).
+        let cb = Cfg { dm, dff: e_n * dff, layers: 1 };
+        let stb = Stored::new(&cb, vocab, &dev)?;
+        let ffb = { let np = ffn_total(&cb); let noise = Tensor::randn(0f32, 1f32, (np,), &dev)?; Var::from_tensor(&noise.mul(&Tensor::from_vec(ffn_prior(&cb), (np,), &dev)?)?)? };
+        let ffb_c = ffb.clone();
+        let mut vb = stb.vars(); vb.push(ffb.clone());
+        train(vb, &|| Ok(ffb_c.as_tensor().clone()), train_s, test_s, test_mask, &stb, &cb, steps, l, bs, lr, 0, &dev)?;
+        let bpb_big = eval_bpb(test_s, tb, &stb, ffb_c.as_tensor(), &cb, l, &dev)?;
+        let p_big = stb.n_params() + ffb_c.as_tensor().elem_count();
+
+        println!("[lm]   dense-small (dff={dff:4}) BPB={bpb_small:.3}  params={p_small}");
+        println!("[lm]   MoE ({e_n}×dff={dff})      BPB={bpb_moe:.3}  total={p_moe_total} active≈{p_moe_active}");
+        println!("[lm]   dense-big  (dff={:4}) BPB={bpb_big:.3}  params={p_big}", e_n * dff);
+        println!("[lm]   Δ(small−moe)={:+.3}  Δ(moe−big)={:+.3}", bpb_small - bpb_moe, bpb_moe - bpb_big);
+        println!("[lm] done (moe). MoE < dense-small AND ≈ dense-big at ~dense-small ACTIVE params ⇒ sparse capacity wins (Pillar 3). Ours.");
+        return Ok(());
+    }
+
+    // --- MODE=genmoe: Pillar 1 × Pillar 3 — GENERATE the MoE experts from a fractal
+    // seed. The experts are the large redundant mass; can a tiny seed produce them
+    // and keep the MoE win? stored-MoE vs gen-MoE (seed) vs dense-small, by BPB. ---
+    if mode == "genmoe" {
+        let e_n: usize = std::env::var("MOE_E").ok().and_then(|s| s.parse().ok()).unwrap_or(4);
+        let merges_path = format!("{}/data_cache/bpe_merges.txt", env!("CARGO_MANIFEST_DIR"));
+        let blens = token_byte_lengths(&corpus, &tok, &merges_path)?;
+        let tb = &blens[split..];
+        let per = 2 * dm * dff + dff + dm;          // one expert's params
+        let total_experts = e_n * per;              // the mass we try to generate
+        println!("[lm] MODE=genmoe (Pillar 1×3) [{tok}]: generate {e_n} experts (dff={dff}, {total_experts} params) from a fractal seed");
+
+        // dense-small floor.
+        let cs = Cfg { dm, dff, layers: 1 };
+        let sts = Stored::new(&cs, vocab, &dev)?;
+        let ffs = { let np = ffn_total(&cs); let noise = Tensor::randn(0f32, 1f32, (np,), &dev)?; Var::from_tensor(&noise.mul(&Tensor::from_vec(ffn_prior(&cs), (np,), &dev)?)?)? };
+        let ffs_c = ffs.clone();
+        let mut vs = sts.vars(); vs.push(ffs.clone());
+        train(vs, &|| Ok(ffs_c.as_tensor().clone()), train_s, test_s, test_mask, &sts, &cs, steps, l, bs, lr, 0, &dev)?;
+        let bpb_small = eval_bpb(test_s, tb, &sts, ffs_c.as_tensor(), &cs, l, &dev)?;
+
+        // stored-MoE (the quality target).
+        let stm = Stored::new(&cs, vocab, &dev)?;
+        let moe = Moe::new(dm, dff, e_n, &dev)?;
+        let mut vm = stm.vars(); vm.extend(moe.vars());
+        let mut opt = AdamW::new(vm, ParamsAdamW { lr, ..Default::default() })?;
+        let mut rng = StdRng::seed_from_u64(0);
+        for _ in 0..steps {
+            let (ids, tg) = sample_batch(train_s, bs, l, &mut rng, &dev)?;
+            let (logits, aux) = forward_moe(&ids, &stm, &moe, dm, &dev)?;
+            let loss = (candle_nn::loss::cross_entropy(&logits, &tg.reshape((bs * l,))?)? + (aux * 0.01)?)?;
+            opt.backward_step(&loss)?;
+        }
+        let bpb_stored = eval_bpb_moe(test_s, tb, &stm, &moe, dm, l, &dev)?;
+
+        // gen-MoE: a fractal seed generates all E experts; gate stored.
+        let mut prior = Vec::with_capacity(total_experts);
+        let one = ffn_prior(&Cfg { dm, dff, layers: 1 });
+        for _ in 0..e_n { prior.extend_from_slice(&one); }
+        let (chunk, ed, hh) = (256usize, 8usize, 16usize);
+        let seed = FractalSeed::new(total_experts, prior, chunk, ed, hh, &dev)?;
+        let seed_p = seed.seed_params();
+        let stg = Stored::new(&cs, vocab, &dev)?;
+        let gate_g = var_randn((dm, e_n), (1.0 / dm as f64).sqrt(), &dev)?;
+        let mut vg = stg.vars(); vg.push(gate_g.clone()); vg.extend(seed.vars());
+        let mut optg = AdamW::new(vg, ParamsAdamW { lr, ..Default::default() })?;
+        let mut rng2 = StdRng::seed_from_u64(1);
+        for _ in 0..steps {
+            let (ids, tg) = sample_batch(train_s, bs, l, &mut rng2, &dev)?;
+            let ex = seed.generate()?;
+            let (logits, aux) = forward_moe_gen(&ids, &stg, gate_g.as_tensor(), &ex, dm, dff, e_n, &dev)?;
+            let loss = (candle_nn::loss::cross_entropy(&logits, &tg.reshape((bs * l,))?)? + (aux * 0.01)?)?;
+            optg.backward_step(&loss)?;
+        }
+        let ex_final = seed.generate()?;
+        let bpb_gen = eval_bpb_moe_gen(test_s, tb, &stg, gate_g.as_tensor(), &ex_final, dm, dff, e_n, l, &dev)?;
+        let comp = total_experts as f64 / (seed_p + dm * e_n) as f64;
+
+        println!("[lm]   dense-small (dff={dff})           BPB={bpb_small:.3}");
+        println!("[lm]   stored-MoE  ({e_n}×dff={dff})        BPB={bpb_stored:.3}  expert-params={total_experts}");
+        println!("[lm]   gen-MoE     (seed {seed_p}+gate)   BPB={bpb_gen:.3}  expert-mass {comp:.1}× compressed");
+        println!("[lm]   Δ(gen−stored)={:+.3}  Δ(gen−small)={:+.3}", bpb_gen - bpb_stored, bpb_gen - bpb_small);
+        println!("[lm] done (genmoe). Read: gen-MoE ≈ stored-MoE ⇒ experts are generable; gen-MoE > stored-MoE (and > dense-small) ⇒ language experts resist generation → STORE (+ quantize) the experts, don't generate them.");
+        return Ok(());
+    }
+
+    // --- MODE=g1: capability-per-RAM (Gate G1 spirit). Assemble the DECIDED
+    // architecture — lean SSM + STORED top-1 MoE — and show it wins per byte, with
+    // int8 on the actual FFN/expert mass (the weights the 8GB claim rests on).
+    // dense-small vs MoE vs dense-big, each at fp32 and int8. Ours, no teacher. ---
+    if mode == "g1" {
+        let e_n: usize = std::env::var("MOE_E").ok().and_then(|s| s.parse().ok()).unwrap_or(4);
+        let merges_path = format!("{}/data_cache/bpe_merges.txt", env!("CARGO_MANIFEST_DIR"));
+        let blens = token_byte_lengths(&corpus, &tok, &merges_path)?;
+        let tb = &blens[split..];
+        println!("[lm] MODE=g1 (capability-per-RAM) [{tok}]: lean SSM + stored MoE vs dense, fp32 & int8 on the FFN mass");
+
+        // dense-small (dff)
+        let cs = Cfg { dm, dff, layers: 1 };
+        let sts = Stored::new(&cs, vocab, &dev)?;
+        let ffs = { let np = ffn_total(&cs); let noise = Tensor::randn(0f32, 1f32, (np,), &dev)?; Var::from_tensor(&noise.mul(&Tensor::from_vec(ffn_prior(&cs), (np,), &dev)?)?)? };
+        let ffs_c = ffs.clone();
+        let mut vs = sts.vars(); vs.push(ffs.clone());
+        train(vs, &|| Ok(ffs_c.as_tensor().clone()), train_s, test_s, test_mask, &sts, &cs, steps, l, bs, lr, 0, &dev)?;
+        let small_fp32 = eval_bpb(test_s, tb, &sts, ffs_c.as_tensor(), &cs, l, &dev)?;
+        let small_int8 = eval_bpb(test_s, tb, &sts, &quantized(ffs_c.as_tensor(), 8, &dev)?, &cs, l, &dev)?;
+        let small_ffn = ffs_c.as_tensor().elem_count();
+
+        // MoE (E × dff), stored
+        let stm = Stored::new(&cs, vocab, &dev)?;
+        let moe = Moe::new(dm, dff, e_n, &dev)?;
+        let mut vm = stm.vars(); vm.extend(moe.vars());
+        let mut opt = AdamW::new(vm, ParamsAdamW { lr, ..Default::default() })?;
+        let mut rng = StdRng::seed_from_u64(0);
+        for _ in 0..steps {
+            let (ids, tg) = sample_batch(train_s, bs, l, &mut rng, &dev)?;
+            let (logits, aux) = forward_moe(&ids, &stm, &moe, dm, &dev)?;
+            let loss = (candle_nn::loss::cross_entropy(&logits, &tg.reshape((bs * l,))?)? + (aux * 0.01)?)?;
+            opt.backward_step(&loss)?;
+        }
+        let moe_fp32 = eval_bpb_moe(test_s, tb, &stm, &moe, dm, l, &dev)?;
+        // flatten experts into forward_moe_gen's layout, then int8 the mass
+        let mut exflat: Vec<f32> = Vec::new();
+        for ex in &moe.experts {
+            for var in [&ex.w1, &ex.b1, &ex.w2, &ex.b2] { exflat.extend(var.as_tensor().flatten_all()?.to_vec1::<f32>()?); }
+        }
+        let moe_ffn = exflat.len();
+        let ex_q = Tensor::from_vec(fake_quant_vec(&exflat, 8), (moe_ffn,), &dev)?;
+        let moe_int8 = eval_bpb_moe_gen(test_s, tb, &stm, moe.gate.as_tensor(), &ex_q, dm, dff, e_n, l, &dev)?;
+
+        // dense-big (E·dff)
+        let cb = Cfg { dm, dff: e_n * dff, layers: 1 };
+        let stb = Stored::new(&cb, vocab, &dev)?;
+        let ffb = { let np = ffn_total(&cb); let noise = Tensor::randn(0f32, 1f32, (np,), &dev)?; Var::from_tensor(&noise.mul(&Tensor::from_vec(ffn_prior(&cb), (np,), &dev)?)?)? };
+        let ffb_c = ffb.clone();
+        let mut vb = stb.vars(); vb.push(ffb.clone());
+        train(vb, &|| Ok(ffb_c.as_tensor().clone()), train_s, test_s, test_mask, &stb, &cb, steps, l, bs, lr, 0, &dev)?;
+        let big_fp32 = eval_bpb(test_s, tb, &stb, ffb_c.as_tensor(), &cb, l, &dev)?;
+        let big_ffn = ffb_c.as_tensor().elem_count();
+
+        let kb = |params: usize, bits: usize| params as f64 * bits as f64 / 8.0 / 1024.0;
+        println!("[lm]  model         BPB(fp32) BPB(int8)  FFN-KB(fp32) FFN-KB(int8)");
+        println!("[lm]  dense-small    {small_fp32:.3}    {small_int8:.3}      {:.1}        {:.1}", kb(small_ffn, 32), kb(small_ffn, 8));
+        println!("[lm]  MoE ({e_n}×)        {moe_fp32:.3}    {moe_int8:.3}      {:.1}        {:.1}", kb(moe_ffn, 32), kb(moe_ffn, 8));
+        println!("[lm]  dense-big      {big_fp32:.3}      —        {:.1}          —", kb(big_ffn, 32));
+        println!("[lm]  Δ(MoE-int8 − dense-small-fp32) BPB = {:+.3} at {:.1}KB vs {:.1}KB FFN RAM", moe_int8 - small_fp32, kb(moe_ffn, 8), kb(small_ffn, 32));
+        println!("[lm] done (g1). MoE-int8 lower BPB at ≤ dense-small FFN-RAM ⇒ capability-per-GB win; and int8 ~free on the LM mass. Knowledge (retrieval) lives on disk, off-RAM. Ours.");
+        return Ok(());
+    }
+
+    // --- MODE=lattice: Pillar 3's SYMBOLIC half — the hallucination killer.
+    // Continuous retrieval (our encoder) proposes a candidate; a SYMBOLIC check
+    // (exact digit-level consistency between query and retrieved key) vetoes and
+    // ABSTAINS when the store doesn't actually support an answer, instead of
+    // confidently emitting a wrong value. Measured on answerable + unanswerable
+    // queries: does the lattice kill hallucinations while preserving real answers?
+    if mode == "lattice" {
+        let n_ent = std::env::var("LN").ok().and_then(|s| s.parse().ok()).unwrap_or(2000usize);
+        let d_key = 12usize;
+        let tau = std::env::var("TAU").ok().and_then(|s| s.parse().ok()).unwrap_or(2usize); // max symbolic mismatches to accept
+        // RANDOM 12-digit keys (well-separated: expected Hamming ≈ 11 between keys),
+        // so the symbolic check cleanly tells in-store (Hamming ~1) from out-of-store.
+        let mut rng = StdRng::seed_from_u64(100 + n_ent as u64);
+        let rand_key = |r: &mut StdRng| -> Vec<u8> { (0..d_key).map(|_| b'0' + r.gen_range(0..10u8)).collect() };
+        let keys: Vec<Vec<u8>> = (0..n_ent).map(|_| rand_key(&mut rng)).collect();
+        let val_of: Vec<u32> = (0..n_ent).map(|_| rng.gen_range(0..10u32)).collect();
+
+        // Our retriever (noisy key → clean key), then encode the store of N keys.
+        let (enc, _rl) = vyoma_embed::train_encoder(
+            96, 256, 1, 1500, 128, 1e-3, 0.05, &dev, 7 + n_ent as u64,
+            |r: &mut StdRng| {
+                let e = r.gen_range(0..n_ent);
+                let clean = keys[e].clone();
+                let mut q = clean.clone();
+                let pos = r.gen_range(0..q.len());
+                q[pos] = b'0' + r.gen_range(0..10u8);
+                (q, clean)
+            },
+        )?;
+        let recs = keys.clone();
+        let store = vyoma_embed::embed_all(&enc, &recs, &dev)?;
+        let hamming = |a: &[u8], b: &[u8]| a.iter().zip(b).filter(|(x, y)| x != y).count();
+
+        // Answerable: noisy versions of IN-store keys. Unanswerable: fresh random
+        // keys the store never saw.
+        let n_q = 1000usize;
+        let mut qr = StdRng::seed_from_u64(55 + n_ent as u64);
+        let make_query = |e: usize, qr: &mut StdRng| -> Vec<u8> {
+            let mut q = keys[e].clone();
+            let pos = qr.gen_range(0..q.len());
+            q[pos] = b'0' + qr.gen_range(0..10u8);
+            q
+        };
+        // metrics
+        let (mut ans_correct_nolat, mut ans_acc_correct, mut ans_accepted) = (0usize, 0usize, 0usize);
+        let mut unans_halluc_lat = 0usize; // unanswerable queries the lattice wrongly accepts
+        for _ in 0..n_q {
+            // answerable
+            let e = qr.gen_range(0..n_ent);
+            let q = make_query(e, &mut qr);
+            let r = vyoma_embed::nearest(&vyoma_embed::embed_all(&enc, &[q.clone()], &dev)?[0], &store);
+            if val_of[r] == val_of[e] { ans_correct_nolat += 1; }                 // no-lattice: always answers
+            if hamming(&q, &recs[r]) <= tau {                                     // symbolic accept
+                ans_accepted += 1;
+                if val_of[r] == val_of[e] { ans_acc_correct += 1; }
+            }
+            // unanswerable (fresh random key not in store)
+            let u = rand_key(&mut qr);
+            let ru = vyoma_embed::nearest(&vyoma_embed::embed_all(&enc, &[u.clone()], &dev)?[0], &store);
+            if hamming(&u, &recs[ru]) <= tau { unans_halluc_lat += 1; }           // lattice-accepted ⇒ a hallucination
+        }
+        let na = n_q as f64;
+        println!("[lm] MODE=lattice (Pillar 3 symbolic half) — N={n_ent} keys, τ={tau}, {n_q} answerable + {n_q} unanswerable queries");
+        println!("[lm]  ANSWERABLE:  no-lattice acc {:.3} (always answers) | with-lattice acc {:.3} on accepted, coverage {:.3}",
+                 ans_correct_nolat as f64 / na, ans_acc_correct as f64 / ans_accepted.max(1) as f64, ans_accepted as f64 / na);
+        println!("[lm]  UNANSWERABLE: hallucination rate  no-lattice 1.000 (always answers) → with-lattice {:.3}", unans_halluc_lat as f64 / na);
+        println!("[lm] done (lattice). Symbolic veto abstains on unsupported queries ⇒ hallucinations killed, real answers preserved. Continuous retrieval + symbolic check = Trinity. Ours.");
+        return Ok(());
+    }
+
+    // --- MODE=evolve: Pillar 5 — bounded self-evolution + homeostasis. The model
+    // evolves by WRITING new facts to its store (not risky weight edits ⇒ no
+    // catastrophic forgetting). A homeostasis controller gates every write using the
+    // symbolic consistency check (Pillar 3b): a fact whose key already exists with a
+    // DIFFERENT value (a contradiction / poisoning attempt) is REJECTED, keeping the
+    // system stable as it grows. naive (accept all) vs homeostasis, across rounds. ---
+    if mode == "evolve" {
+        let d_key = 12usize;
+        let rounds = std::env::var("ROUNDS").ok().and_then(|s| s.parse().ok()).unwrap_or(5usize);
+        let per_round = std::env::var("PERROUND").ok().and_then(|s| s.parse().ok()).unwrap_or(250usize);
+        let mut rng = StdRng::seed_from_u64(2024);
+        let rand_key = |r: &mut StdRng| -> Vec<u8> { (0..d_key).map(|_| b'0' + r.gen_range(0..10u8)).collect() };
+
+        // Our retriever, trained generically (noisy 12-digit key → clean key); it
+        // generalizes to any key, so it serves every round's growing store.
+        let (enc, _rl) = vyoma_embed::train_encoder(
+            96, 256, 1, 1500, 128, 1e-3, 0.05, &dev, 99,
+            |r: &mut StdRng| {
+                let clean = (0..d_key).map(|_| b'0' + r.gen_range(0..10u8)).collect::<Vec<u8>>();
+                let mut q = clean.clone();
+                let pos = r.gen_range(0..q.len());
+                q[pos] = b'0' + r.gen_range(0..10u8);
+                (q, clean)
+            },
+        )?;
+        let emb1 = |k: &[u8], dev: &Device| -> Result<Vec<f32>> { Ok(vyoma_embed::embed_all(&enc, &[k.to_vec()], dev)?[0].clone()) };
+
+        // Two evolving KEY-VALUE stores (dedup by key, last-write-wins — standard KV
+        // semantics, so a contradictory write actually OVERWRITES under naive).
+        // Each = (keys, vals, embeddings, key→index map).
+        use std::collections::HashMap;
+        let (mut nk, mut nv, mut ne): (Vec<Vec<u8>>, Vec<u32>, Vec<Vec<f32>>) = (vec![], vec![], vec![]);
+        let (mut hk, mut hv, mut he): (Vec<Vec<u8>>, Vec<u32>, Vec<Vec<f32>>) = (vec![], vec![], vec![]);
+        let (mut nidx, mut hidx): (HashMap<Vec<u8>, usize>, HashMap<Vec<u8>, usize>) = (HashMap::new(), HashMap::new());
+        let mut good: Vec<(Vec<u8>, u32)> = vec![]; // ground truth (good facts only)
+        let mut rejected = 0usize;
+
+        println!("[lm] MODE=evolve (Pillar 5) — self-evolve by writing to the store (KV, last-write-wins); homeostasis gates writes via symbolic check.");
+        println!("[lm]  round | keys(naive/homeo) | acc-naive | acc-homeo | homeostasis-rejects");
+        for round in 0..rounds {
+            // GOOD facts: fresh random keys + values (both stores insert).
+            for _ in 0..per_round {
+                let k = rand_key(&mut rng);
+                let v = rng.gen_range(0..10u32);
+                let e = emb1(&k, &dev)?;
+                if let Some(&j) = nidx.get(&k) { nv[j] = v; } else { nidx.insert(k.clone(), nk.len()); nk.push(k.clone()); nv.push(v); ne.push(e.clone()); }
+                if let Some(&j) = hidx.get(&k) { hv[j] = v; } else { hidx.insert(k.clone(), hk.len()); hk.push(k.clone()); hv.push(v); he.push(e); }
+                good.push((k, v));
+            }
+            // BAD facts (from round 1): reuse an existing good key with a DIFFERENT
+            // value — a contradictory UPDATE. naive overwrites (corrupts); homeostasis
+            // vetoes (the symbolic check: key exists with a different value ⇒ reject).
+            if round >= 1 {
+                for _ in 0..(per_round / 3) {
+                    let idx = rng.gen_range(0..good.len());
+                    let k = good[idx].0.clone();
+                    let bad_v = (good[idx].1 + 1 + rng.gen_range(0..9u32)) % 10;
+                    if let Some(&j) = nidx.get(&k) { nv[j] = bad_v; }              // naive: overwrite ⇒ poison
+                    match hidx.get(&k) {
+                        Some(&j) if hv[j] != bad_v => rejected += 1,               // homeostasis: veto
+                        Some(_) => {}                                             // same value: no-op
+                        None => { hidx.insert(k.clone(), hk.len()); hk.push(k); hv.push(bad_v); he.push(emb1(&good[idx].0, &dev)?); }
+                    }
+                }
+            }
+            // Evaluate on a sample of GOOD facts (noisy query → nearest key → its
+            // CURRENT value). Under naive, overwritten keys now return the wrong value.
+            let eval = |vs: &[u32], es: &[Vec<f32>], rng: &mut StdRng| -> Result<f64> {
+                let (mut ok, mut n) = (0usize, 0usize);
+                for _ in 0..200 {
+                    let (tk, tv) = &good[rng.gen_range(0..good.len())];
+                    let mut q = tk.clone();
+                    let p = rng.gen_range(0..q.len()); q[p] = b'0' + rng.gen_range(0..10u8);
+                    let j = vyoma_embed::nearest(&emb1(&q, &dev)?, es);
+                    if vs[j] == *tv { ok += 1; }
+                    n += 1;
+                }
+                Ok(ok as f64 / n as f64)
+            };
+            let mut er = StdRng::seed_from_u64(7000 + round as u64);
+            let acc_n = eval(&nv, &ne, &mut er)?;
+            let mut er2 = StdRng::seed_from_u64(7000 + round as u64);
+            let acc_h = eval(&hv, &he, &mut er2)?;
+            println!("[lm]   {round:5} | {:5}/{:5}      |   {acc_n:.3}   |   {acc_h:.3}   | {rejected}", nk.len(), hk.len());
+        }
+        println!("[lm] done (evolve). Homeostasis holds accuracy as the store self-evolves (rejects contradictions); naive degrades as poison accrues. Bounded self-evolution via the store — no forgetting, no weight edits. Ours.");
         return Ok(());
     }
 

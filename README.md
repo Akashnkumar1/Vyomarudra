@@ -6,71 +6,76 @@
 > built corner by corner, entirely our own.
 
 **Vision:** frontier-level capability on a normal 8GB Mac — by redefining the
-architecture, not shrinking a model. Honestly reframed as **capability parity,
-not weight parity** (a lossless 300B model in 8GB is information-theoretically
+architecture, not shrinking a model. Honestly reframed as **capability parity, not
+weight parity** (a lossless 300B model in 8GB is information-theoretically
 impossible; see [`docs/`](docs/)).
 
-**Stack:** Rust, end to end (no Python). A Cargo workspace that grows from
-Phase-0 experiments toward the full system — and, eventually, a Rust AI OS.
-ML via [`candle`](https://github.com/huggingface/candle).
+**Stack:** Rust, end to end (no Python). A Cargo workspace, ML via
+[`candle`](https://github.com/huggingface/candle). Every corner is ours — no wrapped
+models. Pretrained models (phi4-mini) are only ever **teachers we learn from**
+(distillation); none is a runtime component.
 
-## Layout
+## Where this stands (2026-07)
 
-```
-docs/                 the vision (five pillars, roadmap, honest risk register)
-  english/            source of truth
-  hinglish/           mirror
-crates/               every corner built by us — no wrapped models
-  vyoma-e1/           generative weights ("Eternal Seed") + quantization
-  vyoma-ssm/          diagonal SSM backbone (Pillar 2)
-  vyoma-lm/           integrated char/LM: SSM + generated FFN, kNN-LM, diag/kv modes
-  vyoma-retrieval/    retrieval-quality-at-scale (Ontological Store, Pillar 4)
-  vyoma-rag/          E3: externalized knowledge validated on a real model (teacher = lesson only)
-  vyoma-distill/      distillation pipeline — OUR model learns from a teacher (teacher never shipped)
-  vyoma-tokenizer/    byte-level BPE, from scratch
-  (next) scaled distillation corpus · full assembled model · eval harness
-```
+**The achievable architecture is complete, composed, measured, and seed-confirmed —
+every corner built by us.** All five pillars have working corners; the continuous +
+sparse core is assembled into one model; retrieval, symbolic verification, and
+self-evolution compose as layers around it. The one remaining gap to the north star
+is **scale** (data × model × compute) — a compute commitment, not an unproven idea.
 
-## Bottom line so far
+Living detail: **[docs/PROGRESS.md](docs/PROGRESS.md)** (moving log) ·
+**[docs/CRATES.md](docs/CRATES.md)** (what/why/status per crate) ·
+**[docs/english/08-phase0-findings.md](docs/english/08-phase0-findings.md)** (standalone report).
 
-Phase-0 is complete. Full standalone report: **[docs/08 — Phase-0 Findings](docs/english/08-phase0-findings.md)**.
-In one line: weight-generation is real but redundancy-bound (great on image MLPs,
-modest on language, loses on SSM cores); **externalized knowledge (retrieval) is
-the decisive, scalable win**; the achievable architecture is a retrieval-centric
-hybrid, not a magic seed.
+## The five pillars — status
+
+| Pillar | Corner (crate / mode) | Status | Headline |
+|---|---|---|---|
+| **1** Eternal Seed (generative weights) | `vyoma-e1`, `vyoma-ssm`, `vyoma-lm` | ✅ characterized | Fractal seed → **423× on images**, improves with scale; **modest on language**, **loses on SSM cores & MoE experts**. Generation is a *redundancy-bound multiplier*, not the engine. |
+| **2** Resonance Manifold (SSM) | `vyoma-ssm`, `vyoma-lm`, `vyoma-embed` | ✅ | Lean diagonal-SSM backbone; also the retriever's encoder. Stored (not generated). |
+| **3** Trinity (dense/MoE/symbolic) | `vyoma-lm` (`moe`, `g1`, `lattice`) | ✅✅ both halves | Stored top-1 **MoE**: big-model quality at ~small active cost (+0.11 bits/byte over dense-small, scale-invariant & seed-confirmed). **Symbolic lattice**: hallucinations **100%→0%** by vetoing unsupported answers. |
+| **4** Ontological Store (retrieval) | `vyoma-embed`, `vyoma-lm` (`retro`, `retrolm`) | ✅ the engine | Our learned retriever beats classical at matched dim (~8× more dim-efficient); persistent int8 on-disk store (`VYST`, ~64 B/fact); closes E2 with a real retriever; helps a real LM on real text. |
+| **5** Self-evolution + homeostasis | `vyoma-lm` (`evolve`) | ✅ | Model self-evolves by **writing to its store** (no weight edits ⇒ no forgetting); a homeostasis controller vetoes contradictions — naive degrades 1.0→0.76 under poison, homeostasis holds ~1.0. |
+
+Cross-cutting: `vyoma-tokenizer` (byte-level BPE, ours) · `vyoma-distill`
+(teacher→corpus, student is ours) · bits-per-byte eval harness.
+
+## The composed result
+
+The assembled core — **BPE + lean SSM + stored MoE** on our best (distilled) corpus —
+is our strongest model, **BPB 1.847** (best), MoE win seed-confirmed and invariant
+across scale. **Capability-per-RAM** (`MODE=g1`): int8 is ~free on the real LM mass,
+so the MoE matches dense-big quality at **¼ the RAM**, with knowledge held **off-RAM
+on disk**. That is the achievable-vision thesis, measured, ours.
+
+**Scale curve (within-corpus, 1.34 MB):** BPB 2.008 → 1.867 → 1.847 as model+compute
+grow — then flattens: we've reached the **data-bound (Chinchilla) inflection**. The
+next lever is more data + matched model/compute — i.e., throughput/compute, not
+architecture.
+
+## What's NOT done (honest)
+
+Everything is **toy scale** (≤~0.5 M params, ~1–2 MB corpus, one laptop, mostly
+single-run where not marked seed-confirmed). These establish *directions,
+mechanisms, and a composed architecture* — **not a shipped model**. The leap to a
+frontier-competitive 8 GB model is scale (data × model × compute) on real compute;
+the architecture is ready for it.
 
 ## The one principle
 
-> Vision big, bets small. Every grand idea must reduce to a proven technique, or
-> become a cheap, falsifiable Phase-0 experiment. Nothing speculative on the
-> critical path.
+> **Vision big, bets small.** Every grand idea reduces to a proven technique, or a
+> cheap falsifiable experiment. Negative results are kept. Nothing speculative on the
+> critical path — and nothing on the critical path is unproven anymore.
 
-## Status
-
-| Experiment | Pillar | Status | Headline |
-|---|---|---|---|
-| [E1 — generative weights](crates/vyoma-e1/) | 1 (Eternal Seed) | ✅ + scaling law | Fractal seed: **212× on MNIST** (90% of dense from a 962-param seed). **Scaling law:** fixed seed, bigger target ⇒ better — **423× at 90%** for a 512-wide target. Generation improves with scale. Fashion-MNIST: ~76× @ ≤10% loss (data-dependent). |
-| [vyoma-ssm — seed → sequence model](crates/vyoma-ssm/) | 1→2 bridge | ✅ decisive negative | **SSM weights resist generation** (pure & hybrid) — a small stored SSM beats a fractal-generated one; hybrid helps but still loses. Principle: generation pays on **redundant FFN mass**, not lean efficient cores. |
-| [vyoma-lm — integrated model](crates/vyoma-lm/) | 1+2 (Phase 1) | ⚠️ modest, scale-growing | Stored SSM + **generated FFN**, char-LM on real text. At dm=128 the generated FFN ties a small FFN; **at dm=256 it beats it by +2–4 pts** (edge grows with scale & compression) but stays ~11 pts below dense. Generation = a modest supporting player on language, not the engine. |
-| [vyoma-lm — E2 externalized knowledge](crates/vyoma-lm/) | 4 (Ontological Store) | ✅ decisive positive | `MODE=kv`: memorization **collapses** as facts grow (98%→12%), retrieval stays **flat at 97%**. Knowledge belongs on disk, not in weights — capability decoupled from model size. The core of the achievable hybrid. |
-| [vyoma-retrieval — E2b scaling](crates/vyoma-retrieval/) | 4 (Ontological Store) | ✅ positive, **13s** | Retrieval accuracy vs library size: with adequate embedding dim (1024) stays **flat ~97%** across 8.7k passages; too small (128) collapses. The big library holds — governed by embedding dim. No training. |
-| [vyoma-e1 — quantization](crates/vyoma-e1/) | 1 + quant | ✅ composes at 8-bit | `QUANT=1`: 8-bit-quantizing the seed is ~free (127×→**508× byte-compression**, 85.6%→85.5%, 1.6 KB seed). 4-bit breaks it (→57%) — the more you generate-compress, the higher-information each seed param, so less quant headroom. |
-| [vyoma-rag — E3 on a real model](crates/vyoma-rag/) | 4 (Ontological Store) | ✅✅ **real-scale win** | **phi4-mini (3.8B) on the laptop**: 0/20 on novel facts alone → **20/20 with retrieval** (+100 pts). A real model gains capability it lacks in weights, from an external store. The vision's engine, end-to-end, real scale. |
-| E2 — externalized knowledge (RETRO) | 4 | ⬜ next | — |
-| E3 — field dynamics (Mamba + coupling) | 2 | ⬜ | — |
-| E4 — sparse awakening (router) | 3 | ⬜ | — |
-| E5 — stability tooling (Lyapunov) | 5 | ⬜ | — |
-
-**Gate G0** (roadmap): E1 must reach ≥100× at ≤10% quality loss, *or* a credible
-hybrid path. Current: **data-dependent** — MNIST ~200× @ ≤10% loss (cleared), but
-harder **Fashion-MNIST only ~76×** @ ≤10%. Achievable compression tracks data
-redundancy. Cleared on MNIST; the real test is sequence/SSM targets + language.
-
-## Quickstart (E1)
+## Quickstart
 
 ```bash
-cargo build --release -p vyoma-e1
-EPOCHS=15 SEEDS=2 ./target/release/vyoma-e1   # needs MNIST in crates/vyoma-e1/data_cache
+cargo build --release
+# the assembled continuous+sparse core, scored by bits-per-byte:
+MODE=moe TOKENIZER=bpe DATASET=distilled STEPS=4000 DM=128 DFF=192 ./target/release/vyoma-lm
+# capability-per-RAM (int8) · symbolic hallucination veto · self-evolution:
+MODE=g1 ./target/release/vyoma-lm  ·  MODE=lattice ...  ·  MODE=evolve ...
 ```
 
-See [`crates/vyoma-e1/README.md`](crates/vyoma-e1/README.md) for data setup and full results.
+Datasets fetched with `curl -sk` (corporate SSL interception); see crate READMEs.
+Full mode reference: [`crates/vyoma-lm/README.md`](crates/vyoma-lm/README.md).

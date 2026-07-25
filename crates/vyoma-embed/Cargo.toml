@@ -1,0 +1,16 @@
+[package]
+name = "vyoma-embed"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Learned neural retrieval embeddings (RETRO-quality) — our own SSM-encoder, contrastively trained; upgrades the Ontological Store (Pillar 4) engine"
+
+[dependencies]
+candle-core = "0.8"
+candle-nn = "0.8"
+rand = "0.8"
+anyhow = "1"
+
+[[bin]]
+name = "vyoma-embed"
+path = "src/main.rs"

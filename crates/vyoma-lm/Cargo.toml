@@ -10,6 +10,7 @@ candle-core = { version = "0.8", features = ["metal"] }
 candle-nn = { version = "0.8", features = ["metal"] }
 rand = "0.8"
 anyhow = "1"
+vyoma-embed = { path = "../vyoma-embed" }
 
 [[bin]]
 name = "vyoma-lm"

@@ -27,8 +27,38 @@ STEPS=600  DM=64  SEQ=48 DATASET=text  MODE=diag  ./target/release/vyoma-lm
 # the real test: generated FFN vs same-footprint plain vs dense
 STEPS=3000 DM=128 DFF=512 SEQ=48 DATASET=text MODE=sweep ./target/release/vyoma-lm
 ```
-Env: `STEPS DM DFF SEQ DATASET(text|arith) MODE(sweep|diag)`. Text corpus =
-`data_cache/tinyshakespeare.txt` (fetched via `curl -skL`).
+Env: `STEPS DM DFF SEQ DATASET(text|arith) MODE LAYERS TOKENIZER(char|bpe)`. Text
+corpus = `data_cache/tinyshakespeare.txt` (fetched via `curl -skL`).
+
+## Modes (`MODE=…`)
+
+| mode | what it measures | verdict (see PROGRESS.md) |
+|---|---|---|
+| `diag` | does FFN **width** drive quality? (dense-only) | yes on real text — precondition met |
+| `sweep` | generated-FFN vs same-footprint plain vs dense | gen ties plain on language (modest) |
+| `kv` | E2: memorize (value in weights) vs retrieve (oracle) | memorize collapses, retrieve flat ✅ |
+| `knn` | kNN-LM: does an on-disk datastore lift a fixed model? | mechanism right, tiny at toy scale |
+| `bpb` | bits-per-byte (tokenizer-independent eval) | BPE 2.14 vs char 2.85 |
+| `vyoma` | the assembled model (BPE + SSM + gen-FFN), scored by BPB | runs end to end; tokenizer dominates |
+| **`retro`** | **E2 closed with OUR retriever** (`vyoma-embed`), not the oracle: our encoder fetches the fact, our LM reads & answers | memorize collapses, retro(ours) beats it ✅ |
+| **`retrolm`** | the retro loop on **REAL language**: `[neighbor][SEP][passage]` blocks; ablation of retrieved-neighbor vs random-neighbor; scored by masked next-char acc + bits/char (env `RSEEDS`/`RP`/`RSEQ`) | retro < random by −0.040 bits/char over 2 seeds (small, consistent, noisy) |
+| **`moe`** | **Pillar 3**: sparse Mixture-of-Experts FFN (E experts, top-1 gate + load-balance aux); dense-small vs MoE vs dense-big by bits/byte (env `MOE_E`) | MoE 2.682 beats dense-small 2.866 (+0.184) & dense-big 2.711 at ~small active params ✅ |
+| **`genmoe`** | **Pillar 1×3**: generate the E experts from a fractal seed; stored-MoE vs gen-MoE vs dense-small | ❌ gen-MoE 2.957 loses to stored 2.718 & dense-small 2.899 → store+quantize experts, don't generate |
+| **`g1`** | **capability-per-RAM** (Gate-G1 spirit): lean SSM + stored MoE vs dense, at fp32 & int8 on the FFN mass | int8 ~free (2.732→2.730); MoE-int8 beats dense-small-fp32 −0.146 BPB at equal RAM, ≈ dense-big at ¼ RAM ✅ |
+| **`lattice`** | **Pillar 3 symbolic half**: continuous retrieval + a symbolic (Hamming) consistency veto that abstains on unsupported queries (env `LN`/`TAU`) | hallucinations 100%→0% on unanswerable; 99% coverage / 100% precision on answerable ✅ |
+| **`evolve`** | **Pillar 5**: bounded self-evolution via store writes + homeostasis controller (symbolic veto of contradictory writes) (env `ROUNDS`/`PERROUND`) | naive degrades 1.0→0.76 under poison; homeostasis holds ~1.0 (rejects contradictions) ✅ |
+
+```bash
+# RETRO-lite: our retriever + our store + our LM, end to end, no teacher.
+MODE=retro STEPS=2500 DM=64 DFF=128 ./target/release/vyoma-lm
+# tune the retriever (the "keep growing" lever) and the fact-count sweep:
+#   RD=key-digits  RDK=retriever-dk  RDM=retriever-dmodel  RSTEPS=retriever-steps  RNS=comma,list,of,fact,counts
+RD=12 RDK=256 RNS=500,2000,8000 MODE=retro STEPS=2500 ./target/release/vyoma-lm
+```
+
+For the full crate map (what/why/status/left across all crates) see
+[`docs/CRATES.md`](../../docs/CRATES.md); for the moving results log see
+[`docs/PROGRESS.md`](../../docs/PROGRESS.md).
 
 ## Findings
 
