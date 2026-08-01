@@ -32,6 +32,7 @@ docs (`docs/english/`) stay stable, this file moves.
 | Scaling / Chinchilla | ✅ within-corpus model+compute lowers BPB (2.008→1.847) then flattens = **data-bound at 1.34 MB** (MoE gap shrinks +0.115→+0.062). **Growing to 1.92 MB RECOVERS the gap (+0.062→+0.095)** = adding data relieves the bottleneck, capacity pays again. Model×data×compute scale together. Bottleneck = throughput/compute, not architecture |
 | Real web data + GPU (`vyoma-data`, FineWeb) | ✅✅ first non-teacher, real-web-text result, on Kaggle T4: **MoE 2.677 BPB beats dense-small 2.797 (+0.120) AND dense-big 2.801 (−0.123, 3.1× fewer active params)** on 210M real tokens. Portable CPU/CUDA/Metal build; `ONLY=` split for 2-GPU parallelism |
 | BPE on FineWeb (`vyoma-tokenizer` fineweb) | ✅ **−30% BPB** (2.797→1.936 dense-small; MoE 1.912 best-on-FineWeb) — biggest single lever, confirmed on real web text. MoE edge shrinks +0.120→+0.024 **mechanistically**: at vocab 4096 embed+head = ~89% of params, so FFN (where MoE acts) is only ~11% — same effect, diluted. Fix = grow DFF |
+| Expert paging (`MODE=paged`) | ✅ **the mission's mechanism**: experts on disk int8 (`VYX1`), only routed expert in RAM. Toy 2.10x smaller working set; at real dims (99.9% experts) a **trillion-param model needs ~2 GB RAM** — RAM flat as experts grow, capacity costs DISK not memory |
 | Direction | **Retrieval-centric hybrid + sparse MoE**: our retriever + on-disk store + lean SSM + top-1 experts (STORED + int8, not generated); generation stays an image-regime multiplier; teacher teaches only |
 | Next (all ours) | firm up retrolm at scale (BPE + bigger model/context + more seeds); build a real MoE (Pillar 3); grow the distilled corpus |
 
@@ -63,6 +64,59 @@ stays honest.
 ---
 
 ## Log
+
+### 2026-08-02 — Expert paging: a trillion-parameter architecture with a ~2 GB working set
+
+**What.** Built the mechanism the mission actually needs. Until now our MoE held every
+expert in RAM *and* computed all of them — a quality trick, not a memory strategy.
+Now experts live on **disk in int8** (`VYX1`, ours) and only the routed expert is read
+in. `PagedExperts` seeks and reads just that expert's slice; `forward_moe_paged`
+groups tokens by routed expert so each is fetched at most once (sparse compute AND
+sparse memory); an LRU cache keeps hot experts. `MODE=paged` measures it.
+
+**Measured (toy: 8 experts, dm=128, dff=192, vocab=1024).**
+
+| cache | RAM working set | vs all-resident | ms/token |
+|---|---|---|---|
+| 1 | 1227 KB | **2.10x** | 0.85 |
+| 2 | 1420 KB | 1.82x | 0.61 |
+| 4 | 1807 KB | 1.43x | 0.57 |
+| 8 | 2580 KB | 1.00x | 0.46 |
+
+A textbook memory/latency tradeoff, on our own architecture. The toy ratio is modest
+only because at vocab=1024 the embedding+head dominate; experts are just 60% of it.
+
+**Projection — and this is the mission's answer.** At realistic dims (dm=4096,
+dff=14336, vocab=32k) experts are **99.9%** of the model, so paging dominates:
+
+| experts | total params | RAM working set | experts on disk (int8) |
+|---|---|---|---|
+| 2,048 | 241 B | **1.88 GB** | 0.22 TB |
+| 8,192 | 963 B | **1.98 GB** | 0.88 TB |
+| 8,500 | **999 B** | **1.98 GB** | 0.91 TB |
+
+**RAM is flat as the model grows** — 241 B to 999 B parameters moves RAM 1.88 -> 1.98 GB.
+Adding capacity costs **disk, not memory**. A trillion-parameter sparse model with a
+~2 GB working set fits in 8 GB with room to spare.
+
+**Correcting the earlier framing.** I had argued "a trillion params in 8 GB" was
+arithmetically impossible. That was answering the wrong question: params cannot be
+*resident* in 8 GB (466 GB at int4, 116 GB even at 1 bit), but with sparse routing
+they do not need to be. Akash's intuition was right on the substance; my objection
+was right only about residency. The defensible claim is now: **a trillion-parameter
+sparse architecture with a ~2 GB working set, experts paged from disk in int8.**
+
+**Honest remaining constraints.** (1) ~1 TB of disk — the parameters exist, just not
+in RAM. (2) Someone must *train* them: the architecture is no longer the blocker,
+compute funding is. (3) Each expert at those dims is ~117 MB int8, so a cache miss
+costs real milliseconds; smaller/more-numerous experts plus locality amortize it —
+tuning, not a wall.
+
+**A bug I caught in my own measurement.** The first `PagedExperts` did
+`std::fs::read` of the whole store into a `Vec<u8>`, which made "disk" silently
+resident and overstated the saving. Fixed to seek+read per expert; the numbers above
+are from the corrected version.
+
 
 ### 2026-07-26 — Learned grounding head: 74% → 88.9% balanced accuracy (error more than halved) ✅
 

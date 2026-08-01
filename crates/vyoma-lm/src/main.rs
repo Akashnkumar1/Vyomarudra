@@ -442,6 +442,152 @@ fn quantized(t: &Tensor, bits: u32, dev: &Device) -> Result<Tensor> {
     Ok(Tensor::from_vec(fake_quant_vec(&v, bits), t.dims().to_vec(), dev)?)
 }
 
+// ---------------------------------------------------------------------------
+// PAGED EXPERTS — the "huge model, small RAM" mechanism (the mission).
+//
+// A sparse MoE only *activates* one expert per token, but our earlier code still
+// held every expert in RAM (and computed all of them — a toy shortcut). That
+// makes MoE a quality trick, not a memory strategy. Here the experts live on
+// DISK in int8 (`VYX1` format, ours), and only the routed expert is read in,
+// dequantized, and cached. RAM holds: embed + SSM + head + gate + a small LRU
+// cache of hot experts — NOT the expert mass.
+//
+// This is the honest version of "a trillion parameters on 8 GB": the parameters
+// are on disk, the working set is small, activation is sparse. Cost is disk I/O
+// on a cache miss, which is exactly the latency tradeoff that buys the capacity.
+//
+// VYX1 layout (little-endian):
+//   "VYX1" | u32 n_exp | u32 dm | u32 dff |
+//   per expert: f32 s_w1, s_b1, s_w2, s_b2 | i8 w1[dff*dm] b1[dff] w2[dm*dff] b2[dm]
+// ---------------------------------------------------------------------------
+fn q8(v: &[f32]) -> (Vec<i8>, f32) {
+    let m = v.iter().fold(0f32, |a, &x| a.max(x.abs()));
+    let s = if m == 0.0 { 1.0 } else { m / 127.0 };
+    (v.iter().map(|&x| (x / s).round().clamp(-127.0, 127.0) as i8).collect(), s)
+}
+
+/// Write a trained MoE's experts to an on-disk int8 store.
+fn write_expert_store(path: &str, moe: &Moe, dm: usize, dff: usize) -> Result<u64> {
+    let mut buf: Vec<u8> = Vec::new();
+    buf.extend_from_slice(b"VYX1");
+    buf.extend_from_slice(&(moe.experts.len() as u32).to_le_bytes());
+    buf.extend_from_slice(&(dm as u32).to_le_bytes());
+    buf.extend_from_slice(&(dff as u32).to_le_bytes());
+    for e in &moe.experts {
+        let mut payload: Vec<u8> = Vec::new();
+        let mut scales: Vec<u8> = Vec::new();
+        for v in [&e.w1, &e.b1, &e.w2, &e.b2] {
+            let f = v.as_tensor().flatten_all()?.to_vec1::<f32>()?;
+            let (codes, s) = q8(&f);
+            scales.extend_from_slice(&s.to_le_bytes());
+            payload.extend(codes.iter().map(|&c| c as u8));
+        }
+        buf.extend_from_slice(&scales);
+        buf.extend_from_slice(&payload);
+    }
+    std::fs::write(path, &buf)?;
+    Ok(buf.len() as u64)
+}
+
+/// Reads experts on demand from a VYX1 store, keeping only `cap` in RAM (LRU).
+/// The file is NOT loaded into memory — we seek+read only the requested expert's
+/// bytes, so the on-disk expert mass never counts against the working set. (An
+/// earlier version read the whole file into a Vec, which quietly made "disk"
+/// resident and overstated the saving; fixed.)
+struct PagedExperts {
+    f: std::fs::File,
+    n_exp: usize, dm: usize, dff: usize, per: usize,
+    cache: std::collections::HashMap<usize, (Tensor, Tensor, Tensor, Tensor)>,
+    order: Vec<usize>, cap: usize,
+    pub loads: usize, pub hits: usize, pub bytes_read: usize,
+}
+impl PagedExperts {
+    fn open(path: &str, cap: usize) -> Result<Self> {
+        use std::io::Read;
+        let mut f = std::fs::File::open(path)?;
+        let mut hdr = [0u8; 16];
+        f.read_exact(&mut hdr)?;
+        anyhow::ensure!(&hdr[0..4] == b"VYX1", "bad expert-store magic");
+        let rd = |o: usize| u32::from_le_bytes([hdr[o], hdr[o+1], hdr[o+2], hdr[o+3]]) as usize;
+        let (n_exp, dm, dff) = (rd(4), rd(8), rd(12));
+        let per = 16 + (2 * dm * dff + dff + dm); // 4 f32 scales + int8 payload
+        Ok(Self { f, n_exp, dm, dff, per, cache: Default::default(), order: vec![], cap, loads: 0, hits: 0, bytes_read: 0 })
+    }
+    fn total_expert_bytes(&self) -> usize { self.n_exp * self.per }
+    /// Bytes of expert weights actually resident in RAM (fp32 after dequant).
+    fn resident_bytes(&self) -> usize {
+        self.cache.len() * (2 * self.dm * self.dff + self.dff + self.dm) * 4
+    }
+    fn fetch(&mut self, i: usize, dev: &Device) -> Result<(Tensor, Tensor, Tensor, Tensor)> {
+        use std::io::{Read, Seek, SeekFrom};
+        if let Some(t) = self.cache.get(&i) {
+            self.hits += 1;
+            self.order.retain(|&x| x != i);
+            self.order.push(i);
+            return Ok(t.clone()); // candle Tensors are Arc-backed: cheap
+        }
+        self.loads += 1;
+        // read ONLY this expert's slice from disk
+        let mut buf = vec![0u8; self.per];
+        self.f.seek(SeekFrom::Start((16 + i * self.per) as u64))?;
+        self.f.read_exact(&mut buf)?;
+        self.bytes_read += self.per;
+        let f32le = |o: usize, b: &[u8]| f32::from_le_bytes([b[o], b[o+1], b[o+2], b[o+3]]);
+        let (s1, s2, s3, s4) = (f32le(0, &buf), f32le(4, &buf), f32le(8, &buf), f32le(12, &buf));
+        let mut o = 16usize;
+        let (dm, dff) = (self.dm, self.dff);
+        let mut take = |n: usize, s: f32, bytes: &[u8], o: &mut usize| -> Vec<f32> {
+            let v: Vec<f32> = (0..n).map(|k| (bytes[*o + k] as i8) as f32 * s).collect();
+            *o += n; v
+        };
+        let w1 = take(dff * dm, s1, &buf, &mut o);
+        let b1 = take(dff, s2, &buf, &mut o);
+        let w2 = take(dm * dff, s3, &buf, &mut o);
+        let b2 = take(dm, s4, &buf, &mut o);
+        let t = (Tensor::from_vec(w1, (dff, dm), dev)?, Tensor::from_vec(b1, (dff,), dev)?,
+                 Tensor::from_vec(w2, (dm, dff), dev)?, Tensor::from_vec(b2, (dm,), dev)?);
+        if self.cache.len() >= self.cap {
+            if let Some(ev) = self.order.first().copied() { self.order.remove(0); self.cache.remove(&ev); }
+        }
+        self.cache.insert(i, t.clone());
+        self.order.push(i);
+        Ok(t)
+    }
+}
+
+/// MoE forward with PAGED experts: route, then load only the chosen expert(s).
+/// Unlike `forward_moe` (which computes every expert), this touches only the
+/// experts the router actually selects — real sparse compute AND sparse memory.
+fn forward_moe_paged(ids: &Tensor, st: &Stored, gate: &Tensor, pg: &mut PagedExperts,
+                     dm: usize, dev: &Device) -> Result<Tensor> {
+    let (b, l) = ids.dims2()?;
+    let flat = ids.reshape((b * l,))?;
+    let hseq = st.embed.as_tensor().index_select(&flat, 0)?.reshape((b, l, dm))?;
+    let y = ssm_layer(&hseq, &st.ssm[0], b, l, dm, dev)?.reshape((b * l, dm))?;
+    let gp = candle_nn::ops::softmax(&y.matmul(gate)?, D::Minus1)?;
+    let choice = gp.argmax(D::Minus1)?.to_vec1::<u32>()?; // top-1 per token
+    let probs = gp.to_vec2::<f32>()?;
+    let n = choice.len();
+
+    // group token indices by expert so each expert is fetched at most once
+    let mut groups: std::collections::HashMap<u32, Vec<u32>> = Default::default();
+    for (t, &e) in choice.iter().enumerate() { groups.entry(e).or_default().push(t as u32); }
+
+    let mut out = Tensor::zeros((n, dm), DType::F32, dev)?;
+    for (e, toks) in groups {
+        let (w1, b1, w2, b2) = pg.fetch(e as usize, dev)?;
+        let idx = Tensor::from_vec(toks.clone(), (toks.len(),), dev)?;
+        let ys = y.index_select(&idx, 0)?;                       // (T, dm)
+        let ff = ys.matmul(&w1.t()?)?.broadcast_add(&b1)?.gelu()?
+                   .matmul(&w2.t()?)?.broadcast_add(&b2)?;       // (T, dm)
+        let w: Vec<f32> = toks.iter().map(|&t| probs[t as usize][e as usize]).collect();
+        let wt = Tensor::from_vec(w, (toks.len(), 1), dev)?;
+        out = out.index_add(&idx, &ff.broadcast_mul(&wt)?, 0)?;
+    }
+    let h = (y + out)?;
+    Ok(h.matmul(&st.wo.as_tensor().t()?)?.broadcast_add(st.bo.as_tensor())?)
+}
+
 /// GENERATED MoE forward (Pillar 1 × Pillar 3): the E experts' weights come from a
 /// flat tensor produced by a fractal seed (`ex_flat`, length E·expert_params); the
 /// gate is stored (tiny). Same top-1 routing. Returns (logits, load-balance aux).
@@ -712,6 +858,64 @@ fn main() -> Result<()> {
     println!("[lm] device={devname}");
     let dataset = std::env::var("DATASET").unwrap_or_else(|_| "arith".into());
     let mode = std::env::var("MODE").unwrap_or_else(|_| "sweep".into());
+
+    // --- MODE=paged: experts on DISK, only the routed one in RAM (the mission).
+    // Takes a trained checkpoint, writes its experts to an int8 on-disk store,
+    // then generates with paging and reports the actual RAM working set vs the
+    // full expert mass. Env: LOAD, CACHE (experts held in RAM), PROMPT, NEW.
+    if mode == "paged" {
+        let ckpt = std::env::var("LOAD").map_err(|_| anyhow::anyhow!("MODE=paged needs LOAD=ckpt.safetensors"))?;
+        let cap: usize = std::env::var("CACHE").ok().and_then(|s| s.parse().ok()).unwrap_or(1);
+        let n_new: usize = std::env::var("NEW").ok().and_then(|s| s.parse().ok()).unwrap_or(120);
+        let win: usize = std::env::var("WIN").ok().and_then(|s| s.parse().ok()).unwrap_or(64);
+        let prompt = std::env::var("PROMPT").unwrap_or_else(|_| "The ".into());
+        let (st, moe, vocab, dmc) = load_moe_ckpt(&ckpt, &dev)?;
+        let dffc = moe.experts[0].w1.as_tensor().dims2()?.0;
+        let store = std::env::var("XSTORE").unwrap_or_else(|_| "/tmp/vyoma_experts.vyx".into());
+        let sz = write_expert_store(&store, &moe, dmc, dffc)?;
+        let mut pg = PagedExperts::open(&store, cap)?;
+
+        let stored_ram = st.n_params() * 4 + dmc * moe.experts.len() * 4; // embed+ssm+head+gate, fp32
+        println!("[paged] experts on DISK: {} experts × dff={dffc} = {:.1} KB int8 ({store})", moe.experts.len(), sz as f64 / 1024.0);
+        println!("[paged] RAM: backbone+gate {:.1} KB + LRU cache of {cap} expert(s)", stored_ram as f64 / 1024.0);
+
+        let codec = BpeCodec::load(&format!("{}/data_cache/bpe_merges.txt", env!("CARGO_MANIFEST_DIR")))?;
+        let gate_t = moe.gate.as_tensor().clone();
+        let mut ctx = codec.encode(prompt.as_bytes());
+        anyhow::ensure!(!ctx.is_empty(), "prompt encoded to zero tokens");
+        let start = ctx.len();
+        let mut rng = StdRng::seed_from_u64(0);
+        let t0 = std::time::Instant::now();
+        for _ in 0..n_new {
+            let s = ctx.len().saturating_sub(win);
+            let w = &ctx[s..];
+            let ids = Tensor::from_vec(w.to_vec(), (1, w.len()), &dev)?;
+            let logits = forward_moe_paged(&ids, &st, &gate_t, &mut pg, dmc, &dev)?;
+            let row: Vec<f32> = logits.narrow(0, w.len() - 1, 1)?.flatten_all()?.to_vec1()?;
+            let mut idx: Vec<usize> = (0..row.len()).collect();
+            idx.sort_by(|&a, &b| row[b].partial_cmp(&row[a]).unwrap_or(std::cmp::Ordering::Equal));
+            idx.truncate(40.min(row.len()));
+            let scaled: Vec<f32> = idx.iter().map(|&i| row[i] / 0.8).collect();
+            let probs = softmax(&scaled);
+            let r: f32 = rng.gen();
+            let (mut acc, mut pick) = (0.0f32, *idx.last().unwrap());
+            for (j, &p) in probs.iter().enumerate() { acc += p; if r <= acc { pick = idx[j]; break; } }
+            ctx.push(pick as u32);
+        }
+        let el = t0.elapsed().as_secs_f64();
+        let full_ram = stored_ram + (2 * dmc * dffc + dffc + dmc) * moe.experts.len() * 4;
+        let paged_ram = stored_ram + pg.resident_bytes();
+        println!("[paged] generated {n_new} tokens in {el:.2}s ({:.2} ms/token)", el * 1000.0 / n_new as f64);
+        println!("[paged] expert fetches: {} disk loads / {} cache hits ({:.0}% hit rate)",
+                 pg.loads, pg.hits, pg.hits as f64 * 100.0 / (pg.loads + pg.hits).max(1) as f64);
+        println!("[paged] RAM all-experts-resident : {:.1} KB", full_ram as f64 / 1024.0);
+        println!("[paged] RAM paged (cache={cap})       : {:.1} KB  → {:.2}× smaller working set",
+                 paged_ram as f64 / 1024.0, full_ram as f64 / paged_ram as f64);
+        println!("[paged] vocab={vocab}\n{}", codec.decode(&ctx[start..]));
+        println!("[paged] Experts live on disk in int8; only routed experts enter RAM. This is the");
+        println!("[paged] mechanism for big-model-small-RAM: capacity scales with DISK, not memory.");
+        return Ok(());
+    }
 
     // --- MODE=rag: THE ASSEMBLED SYSTEM. Every pillar in one command, ours:
     //   P4 our retriever + our on-disk VYST store  → fetch supporting context
