@@ -1395,12 +1395,29 @@ fn main() -> Result<()> {
             let mut vm = stm.vars(); vm.extend(moe.vars());
             let mut opt = AdamW::new(vm, ParamsAdamW { lr, ..Default::default() })?;
             let mut rng = StdRng::seed_from_u64(0);
-            for _ in 0..steps {
+            // PERIODIC CHECKPOINTING. Cloud sessions die (Kaggle restarted on us and
+            // a full 30k-step run was lost because we only saved at the end).
+            // CKPT_EVERY=N writes the model every N steps, so a killed session costs
+            // at most N steps. Also prints loss so progress is visible in the log.
+            let ckpt_every: usize = std::env::var("CKPT_EVERY").ok().and_then(|s| s.parse().ok()).unwrap_or(1000);
+            let save_path = std::env::var("SAVE").ok();
+            for step in 0..steps {
                 let (ids, tg) = sample_batch(train_s, bs, l, &mut rng, &dev)?;
                 let (logits, aux) = forward_moe(&ids, &stm, &moe, dm, &dev)?;
                 let ce = candle_nn::loss::cross_entropy(&logits, &tg.reshape((bs * l,))?)?;
                 let loss = (ce + (aux * 0.01)?)?;
                 opt.backward_step(&loss)?;
+                if ckpt_every > 0 && (step + 1) % ckpt_every == 0 {
+                    let l_v = loss.to_scalar::<f32>().unwrap_or(f32::NAN);
+                    if let Some(p) = &save_path {
+                        save_moe_ckpt(p, &stm, &moe)?;
+                        println!("[lm]   step {}/{steps} loss {l_v:.4} — checkpoint saved", step + 1);
+                    } else {
+                        println!("[lm]   step {}/{steps} loss {l_v:.4}", step + 1);
+                    }
+                    use std::io::Write;
+                    std::io::stdout().flush().ok();
+                }
             }
             let bpb_moe = eval_bpb_moe(test_s, tb, &stm, &moe, dm, l, &dev)?;
             let p_moe_total = stm.n_params() + moe.n_params();
