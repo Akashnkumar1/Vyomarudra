@@ -33,6 +33,7 @@ docs (`docs/english/`) stay stable, this file moves.
 | Real web data + GPU (`vyoma-data`, FineWeb) | ✅✅ first non-teacher, real-web-text result, on Kaggle T4: **MoE 2.677 BPB beats dense-small 2.797 (+0.120) AND dense-big 2.801 (−0.123, 3.1× fewer active params)** on 210M real tokens. Portable CPU/CUDA/Metal build; `ONLY=` split for 2-GPU parallelism |
 | BPE on FineWeb (`vyoma-tokenizer` fineweb) | ✅ **−30% BPB** (2.797→1.936 dense-small; MoE 1.912 best-on-FineWeb) — biggest single lever, confirmed on real web text. MoE edge shrinks +0.120→+0.024 **mechanistically**: at vocab 4096 embed+head = ~89% of params, so FFN (where MoE acts) is only ~11% — same effect, diluted. Fix = grow DFF |
 | **FineWeb 30k-step runs** | ✅✅ **BPB 1.768 (4 exp) / 1.701 (16 exp)** — 4x experts, 2x params, better BPB at **identical active compute** (3.547M vs 3.552M). Writes real English. The mission thesis, measured on real web text |
+| Instruction tuning (`SFT=1`, `CHAT=1`) | ⚠️ format learned (emits `<|assistant|>`, stops at `<|end|>`), semantics NOT — out-of-distribution prompts get randomly-recalled answers. 462K params on 126 pairs; needs scale |
 | Expert-count scaling | ✅ 4/16/32/64 experts on FineWeb: BPB **1.768/1.701/1.687/1.684** — 6× params for 0.65% more active compute. Returns collapse past ~32 (data-bound at 60M tokens) |
 | int8 / int4 quantization | ✅ measured cost: int8 **+0.01%**, int4 **+0.09%** BPB. Trillion-class working set **1.98 → 0.59 → 0.48 GB**. Our own kernel (threaded, stdlib) — candle has no int8 dtype |
 | Expert paging (`MODE=paged`) | ✅ **the mission's mechanism**: experts on disk int8 (`VYX1`), only routed expert in RAM. Toy 2.10x smaller working set; at real dims (99.9% experts) a **trillion-param model needs ~2 GB RAM** — RAM flat as experts grow, capacity costs DISK not memory |
@@ -67,6 +68,46 @@ stays honest.
 ---
 
 ## Log
+
+### 2026-08-02 — Instruction tuning: the FORMAT is learned, the semantics are not (honest)
+
+**What.** Closed the "it continues text instead of replying" gap architecturally.
+`vyoma-distill SFT=1` has the teacher write (instruction, response) pairs wrapped in
+turn markers (`<|user|>` / `<|assistant|>` / `<|end|>`); `vyoma-lm DATASET=sft` trains
+on them; `CHAT=1` frames a prompt as a user turn at inference and stops at `<|end|>`.
+Teacher supplies data only, never ships — the standing principle holds.
+
+**Result: 126 pairs (56 KB), 462 K-param MoE, 2500 steps.**
+
+Behaviour genuinely changed:
+
+| | output for a prompt |
+|---|---|
+| base (no framing) | `hi` → `"hipping/paperwork/electronic document transfer…"` |
+| `CHAT=1` | `What is gravity?` → `<\|assistant\|>` `"Gravity: a force that attracts two bodies with mass…"` |
+
+**But that answer is MEMORISED, not understood.** Nearly the same sentence is in the
+training data. Out-of-distribution it collapses entirely:
+
+| prompt | reply |
+|---|---|
+| "What is a submarine?" | *"Fossils are formed when organisms die…"* |
+| "How do I bake bread?" | *"Languages evolve through phonetic shifts…"* |
+
+It emits a well-formed turn containing a randomly-recalled answer, with **no mapping
+from question to content**. BPB 6.585 confirms severe overfitting (26 K training
+tokens).
+
+**Verdict.** ✅ conversational *structure* is now part of the architecture — turn
+markers, assistant role, stopping behaviour. ❌ instruction *following* is not
+learned, and cannot be at this scale: 462 K parameters on 126 examples. This is the
+"reply-shaped, not useful" outcome predicted before the run, recorded as such rather
+than showcased via the one memorised example that looks impressive.
+
+**Why it still matters.** The format is the part that must exist in the architecture;
+semantics come from scale and data. When a larger model trains on orders more
+instruction pairs, it lands on a system that already knows what a turn is.
+
 
 ### 2026-08-02 — Expert-count scaling curve complete + int4: 999B params in 0.48 GB
 
