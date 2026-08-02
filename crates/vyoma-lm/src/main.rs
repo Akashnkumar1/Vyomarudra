@@ -1579,6 +1579,60 @@ fn main() -> Result<()> {
     // --- MODE=moe: Pillar 3 — sparse Mixture-of-Experts. Does routing to top-1 of
     // E experts (dff each) buy dense-big (dff=E·dff) capacity at dense-small
     // (dff) active compute? Scored by bits-per-byte on real text. Ours, no teacher.
+    // --- MODE=q8bpb: what does int8 actually COST in quality? Everything above
+    // measures memory; this measures the price. Same trained checkpoint, same
+    // held-out text, scored three ways: f32 weights, int8 experts, and fully int8
+    // (experts + embedding + head). Any degradation shows up directly in BPB.
+    if mode == "q8bpb" {
+        let ckpt = std::env::var("LOAD").map_err(|_| anyhow::anyhow!("MODE=q8bpb needs LOAD=ckpt.safetensors"))?;
+        let (st, moe, _v, dmc) = load_moe_ckpt(&ckpt, &dev)?;
+        let dffc = moe.experts[0].w1.as_tensor().dims2()?.0;
+        let merges_path = format!("{}/data_cache/bpe_merges.txt", env!("CARGO_MANIFEST_DIR"));
+        let blens = token_byte_lengths(&corpus, &tok, &merges_path)?;
+        let tb = &blens[split..];
+        let store = std::env::var("XSTORE").unwrap_or_else(|_| "/tmp/vyoma_q8bpb.vyx".into());
+        write_expert_store(&store, &moe, dmc, dffc)?;
+        let bb = Q8Backbone::from_stored(&st, moe.gate.as_tensor())?;
+        let gate_t = moe.gate.as_tensor().clone();
+
+        // BPB over the held-out stream. A macro, not a closure: each variant
+        // needs different borrows of `dev`/`st`, which boxed closures cannot hold
+        // simultaneously.
+        macro_rules! score {
+            ($name:expr, $fwd:expr) => {{
+                let (mut bits, mut bytes, mut cnt, mut e0) = (0f64, 0f64, 0usize, 0usize);
+                while cnt < 2000 && e0 + l + 1 <= test_s.len() {
+                    let ids = Tensor::from_vec(test_s[e0..e0 + l].to_vec(), (1, l), &dev)?;
+                    let rows = $fwd(&ids)?.to_vec2::<f32>()?;
+                    for t in 0..l {
+                        if cnt >= 2000 { break; }
+                        let truth = test_s[e0 + t + 1] as usize;
+                        let r = &rows[t];
+                        let m = r.iter().cloned().fold(f32::MIN, f32::max);
+                        let lse = m + r.iter().map(|v| (v - m).exp()).sum::<f32>().ln();
+                        bits += (-(r[truth] - lse) as f64) / std::f64::consts::LN_2;
+                        bytes += tb[e0 + t + 1] as f64;
+                        cnt += 1;
+                    }
+                    e0 += l;
+                }
+                let bpb = bits / bytes;
+                println!("[q8bpb]  {:<34} BPB = {:.4}", $name, bpb);
+                bpb
+            }};
+        }
+        println!("[q8bpb] same checkpoint, same held-out text -- what does quantization cost?");
+        let f32_bpb = score!("f32 weights (reference)", |ids: &Tensor| forward_moe(ids, &st, &moe, dmc, &dev).map(|r| r.0));
+        let mut pg1 = PagedExperts::open(&store, moe.experts.len())?;
+        let i8e = score!("int8 experts", |ids: &Tensor| forward_moe_paged(ids, &st, &gate_t, &mut pg1, dmc, &dev));
+        let mut pg2 = PagedExperts::open(&store, moe.experts.len())?;
+        let full = score!("int8 experts + embed + head", |ids: &Tensor| forward_q8(ids, &bb, &st.ssm[0], &gate_t, &mut pg2, dmc, &dev));
+        println!("[q8bpb] cost of int8 experts        : {:+.4} bits/byte ({:+.2}%)", i8e - f32_bpb, (i8e - f32_bpb) / f32_bpb * 100.0);
+        println!("[q8bpb] cost of FULL int8           : {:+.4} bits/byte ({:+.2}%)", full - f32_bpb, (full - f32_bpb) / f32_bpb * 100.0);
+        println!("[q8bpb] Near-zero ⇒ the model is indifferent to int8, and the 3.4× memory win is free.");
+        return Ok(());
+    }
+
     if mode == "moe" {
         let e_n: usize = std::env::var("MOE_E").ok().and_then(|s| s.parse().ok()).unwrap_or(4);
         // ONLY=small,moe,big (comma list; default "all") lets the three independent
