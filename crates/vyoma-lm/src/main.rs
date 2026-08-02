@@ -387,69 +387,92 @@ impl Expert {
             .matmul(&self.w2.as_tensor().t()?)?.broadcast_add(self.b2.as_tensor())?)
     }
 }
-struct Moe { gate: Var, experts: Vec<Expert> }
+/// One MoE block: its own router and its own expert set. Standard practice
+/// (Switch/Mixtral) is per-layer experts rather than sharing one pool.
+struct MoeLayer { gate: Var, experts: Vec<Expert> }
+
+/// DEPTH. Until now the whole model was ONE block — `layers: 1`, `ssm[0]`, no
+/// loop — which is why generation was fluent but never composed an idea: a
+/// single block can pattern-match, it cannot build abstraction on top of
+/// abstraction. Real LMs are tens of blocks deep. `Moe` now holds L blocks and
+/// the forward pass stacks them with residuals.
+struct Moe { layers: Vec<MoeLayer> }
+
 impl Moe {
-    fn new(dm: usize, dff: usize, e: usize, dev: &Device) -> Result<Self> {
-        Ok(Self {
-            gate: var_randn((dm, e), (1.0 / dm as f64).sqrt(), dev)?,
-            experts: (0..e).map(|_| Expert::new(dm, dff, dev)).collect::<Result<_>>()?,
-        })
+    fn new(dm: usize, dff: usize, e: usize, dev: &Device) -> Result<Self> { Self::new_l(dm, dff, e, 1, dev) }
+    fn new_l(dm: usize, dff: usize, e: usize, n_layers: usize, dev: &Device) -> Result<Self> {
+        let layers = (0..n_layers).map(|_| -> Result<MoeLayer> {
+            Ok(MoeLayer {
+                gate: var_randn((dm, e), (1.0 / dm as f64).sqrt(), dev)?,
+                experts: (0..e).map(|_| Expert::new(dm, dff, dev)).collect::<Result<_>>()?,
+            })
+        }).collect::<Result<Vec<_>>>()?;
+        Ok(Self { layers })
     }
+    fn n_layers(&self) -> usize { self.layers.len() }
+    /// First block's router/experts — the single-layer paths (paging, int8) still
+    /// address layer 0 directly.
+    fn gate(&self) -> &Var { &self.layers[0].gate }
+    fn experts(&self) -> &[Expert] { &self.layers[0].experts }
+    fn n_experts(&self) -> usize { self.layers[0].experts.len() }
     fn vars(&self) -> Vec<Var> {
-        let mut v = vec![self.gate.clone()];
-        for e in &self.experts { v.extend(e.vars()); }
+        let mut v = Vec::new();
+        for l in &self.layers { v.push(l.gate.clone()); for e in &l.experts { v.extend(e.vars()); } }
         v
     }
     fn n_params(&self) -> usize { self.vars().iter().map(|v| v.elem_count()).sum() }
-    fn expert_params(&self) -> usize { self.experts[0].vars().iter().map(|v| v.elem_count()).sum() }
+    fn expert_params(&self) -> usize { self.layers[0].experts[0].vars().iter().map(|v| v.elem_count()).sum() }
 }
 
 /// MoE forward. Returns (logits (B*L,vocab), load-balance aux loss scalar).
 fn forward_moe(ids: &Tensor, st: &Stored, moe: &Moe, dm: usize, dev: &Device) -> Result<(Tensor, Tensor)> {
     let (b, l) = ids.dims2()?;
     let flat = ids.reshape((b * l,))?;
-    let hseq = st.embed.as_tensor().index_select(&flat, 0)?.reshape((b, l, dm))?;
-    let y = ssm_layer(&hseq, &st.ssm[0], b, l, dm, dev)?.reshape((b * l, dm))?; // (N,dm)
-    let gl = y.matmul(moe.gate.as_tensor())?;                 // (N,E)
-    let gp = candle_nn::ops::softmax(&gl, D::Minus1)?;        // (N,E)
-    let (n, e) = gp.dims2()?;
-    let maxp = gp.max_keepdim(D::Minus1)?.broadcast_as((n, e))?;
-    let mask = gp.eq(&maxp)?.to_dtype(DType::F32)?;           // (N,E) top-1 one-hot
-    let w = gp.mul(&mask)?;                                   // (N,E) chosen expert's prob
-    // SPARSE (gathered) expert compute. The obvious implementation applies EVERY
-    // expert to EVERY token and zeroes the unselected ones — correct, but it burns
-    // E× the FLOPs to train a model where top-1 routing uses exactly one expert per
-    // token (64 experts made training ~16× slower than 4). Instead: group the token
-    // indices by their routed expert and run each expert once, on only its own
-    // tokens. index_select/index_add keep this differentiable, so training gets the
-    // same sparsity inference already had. GATHER=0 falls back to the dense path.
+    let mut hseq = st.embed.as_tensor().index_select(&flat, 0)?.reshape((b, l, dm))?;
     let gathered = std::env::var("GATHER").map(|v| v != "0").unwrap_or(true);
-    let out = if gathered {
-        let choice = gp.argmax(D::Minus1)?.to_vec1::<u32>()?;
-        let mut groups: std::collections::HashMap<u32, Vec<u32>> = Default::default();
-        for (t, &ex) in choice.iter().enumerate() { groups.entry(ex).or_default().push(t as u32); }
-        let mut acc = Tensor::zeros((n, dm), DType::F32, dev)?;
-        for (ex, toks) in groups {
-            let idx = Tensor::from_vec(toks.clone(), (toks.len(),), dev)?;
-            let ys = y.contiguous()?.index_select(&idx, 0)?;          // (T,dm) this expert's tokens
-            let ff = moe.experts[ex as usize].apply(&ys)?;            // (T,dm) one expert, once
-            let wsel = w.narrow(1, ex as usize, 1)?.contiguous()?.index_select(&idx, 0)?; // (T,1)
-            acc = acc.index_add(&idx, &ff.mul(&wsel.broadcast_as(ff.shape())?)?, 0)?;
-        }
-        acc
-    } else {
-        let mut acc = Tensor::zeros((n, dm), DType::F32, dev)?;
-        for ei in 0..e {
-            let ff = moe.experts[ei].apply(&y)?;
-            acc = (acc + ff.broadcast_mul(&w.narrow(1, ei, 1)?)?)?;
-        }
-        acc
-    };
-    let h = (y + out)?;                                       // residual
+    let mut aux_total: Option<Tensor> = None;
+    let nl = moe.n_layers().min(st.ssm.len());
+
+    for li in 0..nl {
+        let y = ssm_layer(&hseq, &st.ssm[li], b, l, dm, dev)?.reshape((b * l, dm))?;
+        let ml = &moe.layers[li];
+        let gp = candle_nn::ops::softmax(&y.matmul(ml.gate.as_tensor())?, D::Minus1)?;
+        let (n, e) = gp.dims2()?;
+        let maxp = gp.max_keepdim(D::Minus1)?.broadcast_as((n, e))?;
+        let mask = gp.eq(&maxp)?.to_dtype(DType::F32)?;
+        let w = gp.mul(&mask)?;
+
+        // Sparse (gathered) expert compute: run each expert once on only its own
+        // tokens, instead of applying every expert to every token and zeroing.
+        let out = if gathered {
+            let choice = gp.argmax(D::Minus1)?.to_vec1::<u32>()?;
+            let mut groups: std::collections::HashMap<u32, Vec<u32>> = Default::default();
+            for (t, &ex) in choice.iter().enumerate() { groups.entry(ex).or_default().push(t as u32); }
+            let mut acc = Tensor::zeros((n, dm), DType::F32, dev)?;
+            for (ex, toks) in groups {
+                let idx = Tensor::from_vec(toks.clone(), (toks.len(),), dev)?;
+                let ys = y.contiguous()?.index_select(&idx, 0)?;
+                let ff = ml.experts[ex as usize].apply(&ys)?;
+                let wsel = w.narrow(1, ex as usize, 1)?.contiguous()?.index_select(&idx, 0)?;
+                acc = acc.index_add(&idx, &ff.mul(&wsel.broadcast_as(ff.shape())?)?, 0)?;
+            }
+            acc
+        } else {
+            let mut acc = Tensor::zeros((n, dm), DType::F32, dev)?;
+            for ei in 0..e {
+                let ff = ml.experts[ei].apply(&y)?;
+                acc = (acc + ff.broadcast_mul(&w.narrow(1, ei, 1)?)?)?;
+            }
+            acc
+        };
+        hseq = (y + out)?.reshape((b, l, dm))?;   // residual, feeds the next block
+
+        let aux = (mask.mean(0)?.mul(&gp.mean(0)?)?.sum_all()? * e as f64)?;
+        aux_total = Some(match aux_total { Some(a) => (a + aux)?, None => aux });
+    }
+    let h = hseq.reshape((b * l, dm))?;
     let logits = h.matmul(&st.wo.as_tensor().t()?)?.broadcast_add(st.bo.as_tensor())?;
-    // Switch-style load balance: E · Σ_e f_e · P_e  (minimized ⇒ balanced routing)
-    let aux = (mask.mean(0)?.mul(&gp.mean(0)?)?.sum_all()? * e as f64)?;
-    Ok((logits, aux))
+    Ok((logits, aux_total.unwrap()))
 }
 
 /// Per-tensor symmetric fake-quantization of trained weights (offline, no grad):
@@ -494,10 +517,10 @@ fn q8(v: &[f32]) -> (Vec<i8>, f32) {
 fn write_expert_store(path: &str, moe: &Moe, dm: usize, dff: usize) -> Result<u64> {
     let mut buf: Vec<u8> = Vec::new();
     buf.extend_from_slice(b"VYX1");
-    buf.extend_from_slice(&(moe.experts.len() as u32).to_le_bytes());
+    buf.extend_from_slice(&(moe.n_experts() as u32).to_le_bytes());
     buf.extend_from_slice(&(dm as u32).to_le_bytes());
     buf.extend_from_slice(&(dff as u32).to_le_bytes());
-    for e in &moe.experts {
+    for e in moe.experts() {
         let mut payload: Vec<u8> = Vec::new();
         let mut scales: Vec<u8> = Vec::new();
         for v in [&e.w1, &e.b1, &e.w2, &e.b2] {
@@ -1036,12 +1059,14 @@ fn save_moe_ckpt(path: &str, st: &Stored, moe: &Moe) -> Result<()> {
         m.insert(format!("ssm.{i}.c_co"), l.c_co.as_tensor().clone());
         m.insert(format!("ssm.{i}.d_co"), l.d_co.as_tensor().clone());
     }
-    m.insert("moe.gate".into(), moe.gate.as_tensor().clone());
-    for (i, e) in moe.experts.iter().enumerate() {
-        m.insert(format!("moe.{i}.w1"), e.w1.as_tensor().clone());
-        m.insert(format!("moe.{i}.b1"), e.b1.as_tensor().clone());
-        m.insert(format!("moe.{i}.w2"), e.w2.as_tensor().clone());
-        m.insert(format!("moe.{i}.b2"), e.b2.as_tensor().clone());
+    for (li, ml) in moe.layers.iter().enumerate() {
+        m.insert(format!("moe.l{li}.gate"), ml.gate.as_tensor().clone());
+        for (i, e) in ml.experts.iter().enumerate() {
+            m.insert(format!("moe.l{li}.{i}.w1"), e.w1.as_tensor().clone());
+            m.insert(format!("moe.l{li}.{i}.b1"), e.b1.as_tensor().clone());
+            m.insert(format!("moe.l{li}.{i}.w2"), e.w2.as_tensor().clone());
+            m.insert(format!("moe.l{li}.{i}.b2"), e.b2.as_tensor().clone());
+        }
     }
     candle_core::safetensors::save(&m, path)?;
     Ok(())
@@ -1067,14 +1092,25 @@ fn load_moe_ckpt(path: &str, dev: &Device) -> Result<(Stored, Moe, usize, usize)
         });
     }
     let st = Stored { embed: Var::from_tensor(&embed)?, ssm, wo: v("wo")?, bo: v("bo")? };
-    let mut experts = Vec::with_capacity(n_exp);
-    for i in 0..n_exp {
-        experts.push(Expert {
-            w1: v(&format!("moe.{i}.w1"))?, b1: v(&format!("moe.{i}.b1"))?,
-            w2: v(&format!("moe.{i}.w2"))?, b2: v(&format!("moe.{i}.b2"))?,
-        });
+    // Multi-layer keys are `moe.l{L}.{E}.*`; older checkpoints used `moe.{E}.*`
+    // with a single `moe.gate`, so both layouts load.
+    let legacy = t.contains_key("moe.gate");
+    let n_ml = if legacy { 1 } else { (0..).take_while(|i| t.contains_key(&format!("moe.l{i}.gate"))).count().max(1) };
+    let mut layers = Vec::with_capacity(n_ml);
+    for li in 0..n_ml {
+        let (gk, pre) = if legacy { ("moe.gate".to_string(), String::new()) }
+                        else { (format!("moe.l{li}.gate"), format!("l{li}.")) };
+        let ne = if legacy { n_exp } else { (0..).take_while(|i| t.contains_key(&format!("moe.{pre}{i}.w1"))).count() };
+        let mut experts = Vec::with_capacity(ne);
+        for i in 0..ne {
+            experts.push(Expert {
+                w1: v(&format!("moe.{pre}{i}.w1"))?, b1: v(&format!("moe.{pre}{i}.b1"))?,
+                w2: v(&format!("moe.{pre}{i}.w2"))?, b2: v(&format!("moe.{pre}{i}.b2"))?,
+            });
+        }
+        layers.push(MoeLayer { gate: v(&gk)?, experts });
     }
-    Ok((st, Moe { gate: v("moe.gate")?, experts }, vocab, dm))
+    Ok((st, Moe { layers }, vocab, dm))
 }
 
 // ---------------------------------------------------------------------------
@@ -1160,7 +1196,7 @@ fn main() -> Result<()> {
         let win: usize = std::env::var("WIN").ok().and_then(|s| s.parse().ok()).unwrap_or(64);
         let prompt = std::env::var("PROMPT").unwrap_or_else(|_| "The ".into());
         let (st, moe, vocab, dmc) = load_moe_ckpt(&ckpt, &dev)?;
-        let dffc = moe.experts[0].w1.as_tensor().dims2()?.0;
+        let dffc = moe.experts()[0].w1.as_tensor().dims2()?.0;
         let store = std::env::var("XSTORE").unwrap_or_else(|_| "/tmp/vyoma_experts.vyx".into());
         let sz = write_expert_store(&store, &moe, dmc, dffc)?;
         let mut pg = PagedExperts::open(&store, cap)?;
@@ -1168,18 +1204,18 @@ fn main() -> Result<()> {
         // Q8=1 also quantizes the backbone (embedding + output head), which became
         // the dominant resident block once the experts stopped inflating to f32.
         let q8_backbone = std::env::var("Q8").map(|v| v != "0").unwrap_or(false);
-        let bb = if q8_backbone { Some(Q8Backbone::from_stored(&st, moe.gate.as_tensor())?) } else { None };
+        let bb = if q8_backbone { Some(Q8Backbone::from_stored(&st, moe.gate().as_tensor())?) } else { None };
         let stored_ram = match &bb {
             Some(b) => b.bytes() + 6 * dmc * 4
-                + if std::env::var("Q8ROUTER").map(|v| v != "0").unwrap_or(false) { 0 } else { dmc * moe.experts.len() * 4 },
-            None => st.n_params() * 4 + dmc * moe.experts.len() * 4,        // all f32
+                + if std::env::var("Q8ROUTER").map(|v| v != "0").unwrap_or(false) { 0 } else { dmc * moe.n_experts() * 4 },
+            None => st.n_params() * 4 + dmc * moe.n_experts() * 4,        // all f32
         };
-        println!("[paged] experts on DISK: {} experts × dff={dffc} = {:.1} KB int8 ({store})", moe.experts.len(), sz as f64 / 1024.0);
+        println!("[paged] experts on DISK: {} experts × dff={dffc} = {:.1} KB int8 ({store})", moe.n_experts(), sz as f64 / 1024.0);
         println!("[paged] RAM: backbone+gate {:.1} KB ({}) + LRU cache of {cap} expert(s)",
                  stored_ram as f64 / 1024.0, if q8_backbone { "int8" } else { "f32" });
 
         let codec = BpeCodec::load(&format!("{}/data_cache/bpe_merges.txt", env!("CARGO_MANIFEST_DIR")))?;
-        let gate_t = moe.gate.as_tensor().clone();
+        let gate_t = moe.gate().as_tensor().clone();
         let mut ctx = codec.encode(prompt.as_bytes());
         anyhow::ensure!(!ctx.is_empty(), "prompt encoded to zero tokens");
         let start = ctx.len();
@@ -1205,7 +1241,7 @@ fn main() -> Result<()> {
             ctx.push(pick as u32);
         }
         let el = t0.elapsed().as_secs_f64();
-        let full_ram = stored_ram + (2 * dmc * dffc + dffc + dmc) * moe.experts.len() * 4;
+        let full_ram = stored_ram + (2 * dmc * dffc + dffc + dmc) * moe.n_experts() * 4;
         let _ = &bb;
         let paged_ram = stored_ram + pg.resident_bytes();
         println!("[paged] generated {n_new} tokens in {el:.2}s ({:.2} ms/token)", el * 1000.0 / n_new as f64);
@@ -1248,7 +1284,7 @@ fn main() -> Result<()> {
         let (store_embs, store_recs) = vyoma_embed::load_store(&storep)?;
         let codec = BpeCodec::load(&format!("{}/data_cache/bpe_merges.txt", env!("CARGO_MANIFEST_DIR")))?;
         println!("[rag] LM(vocab={vocab} dm={dm} experts={}) + retriever(dk={}) + store({} facts)",
-                 moe.experts.len(), enc.dk, store_recs.len());
+                 moe.n_experts(), enc.dk, store_recs.len());
         println!("[rag] prompt: {prompt:?}");
 
         // P4 — retrieve with OUR encoder over OUR store
@@ -1341,7 +1377,7 @@ fn main() -> Result<()> {
         let temp: f32 = std::env::var("TEMP").ok().and_then(|s| s.parse().ok()).unwrap_or(0.8);
         let topk: usize = std::env::var("TOPK").ok().and_then(|s| s.parse().ok()).unwrap_or(40);
         let win: usize = std::env::var("WIN").ok().and_then(|s| s.parse().ok()).unwrap_or(64);
-        println!("[gen] ckpt={ckpt} vocab={vocab} dm={dm} experts={} | temp={temp} topk={topk} new={n_new}", moe.experts.len());
+        println!("[gen] ckpt={ckpt} vocab={vocab} dm={dm} experts={} | temp={temp} topk={topk} new={n_new}", moe.n_experts());
         println!("[gen] prompt: {prompt:?}");
 
         let mut ctx = codec.encode(prompt.as_bytes());
@@ -1668,14 +1704,14 @@ fn main() -> Result<()> {
     if mode == "q8bpb" {
         let ckpt = std::env::var("LOAD").map_err(|_| anyhow::anyhow!("MODE=q8bpb needs LOAD=ckpt.safetensors"))?;
         let (st, moe, _v, dmc) = load_moe_ckpt(&ckpt, &dev)?;
-        let dffc = moe.experts[0].w1.as_tensor().dims2()?.0;
+        let dffc = moe.experts()[0].w1.as_tensor().dims2()?.0;
         let merges_path = format!("{}/data_cache/bpe_merges.txt", env!("CARGO_MANIFEST_DIR"));
         let blens = token_byte_lengths(&corpus, &tok, &merges_path)?;
         let tb = &blens[split..];
         let store = std::env::var("XSTORE").unwrap_or_else(|_| "/tmp/vyoma_q8bpb.vyx".into());
         write_expert_store(&store, &moe, dmc, dffc)?;
-        let bb = Q8Backbone::from_stored(&st, moe.gate.as_tensor())?;
-        let gate_t = moe.gate.as_tensor().clone();
+        let bb = Q8Backbone::from_stored(&st, moe.gate().as_tensor())?;
+        let gate_t = moe.gate().as_tensor().clone();
 
         // BPB over the held-out stream. A macro, not a closure: each variant
         // needs different borrows of `dev`/`st`, which boxed closures cannot hold
@@ -1705,9 +1741,9 @@ fn main() -> Result<()> {
         }
         println!("[q8bpb] same checkpoint, same held-out text -- what does quantization cost?");
         let f32_bpb = score!("f32 weights (reference)", |ids: &Tensor| forward_moe(ids, &st, &moe, dmc, &dev).map(|r| r.0));
-        let mut pg1 = PagedExperts::open(&store, moe.experts.len())?;
+        let mut pg1 = PagedExperts::open(&store, moe.n_experts())?;
         let i8e = score!("int8 experts", |ids: &Tensor| forward_moe_paged(ids, &st, &gate_t, &mut pg1, dmc, &dev));
-        let mut pg2 = PagedExperts::open(&store, moe.experts.len())?;
+        let mut pg2 = PagedExperts::open(&store, moe.n_experts())?;
         let full = score!("int8 experts + embed + head", |ids: &Tensor| forward_q8(ids, &bb, &st.ssm[0], &gate_t, &mut pg2, dmc, &dev));
         println!("[q8bpb] cost of int8 experts        : {:+.4} bits/byte ({:+.2}%)", i8e - f32_bpb, (i8e - f32_bpb) / f32_bpb * 100.0);
         println!("[q8bpb] cost of FULL int8           : {:+.4} bits/byte ({:+.2}%)", full - f32_bpb, (full - f32_bpb) / f32_bpb * 100.0);
@@ -1749,7 +1785,7 @@ fn main() -> Result<()> {
 
         if run_moe {
             // MoE: E experts of dff, top-1 routing + load-balance aux.
-            let cm = Cfg { dm, dff, layers: 1 };
+            let cm = Cfg { dm, dff, layers };   // DEPTH: stack `layers` blocks (was hardcoded 1)
             // RESUME=1 continues from the SAVE checkpoint if it exists, instead of
             // starting from random weights. Cloud sessions are ephemeral; without
             // this, every restart threw away all prior training and the 30 hours of
@@ -1759,12 +1795,12 @@ fn main() -> Result<()> {
             let (stm, moe) = match (resume, std::env::var("SAVE").ok()) {
                 (true, Some(p)) if std::path::Path::new(&p).exists() => {
                     let (s, m, v_ck, dm_ck) = load_moe_ckpt(&p, &dev)?;
-                    anyhow::ensure!(v_ck == vocab && dm_ck == dm && m.experts.len() == e_n,
-                        "RESUME: checkpoint geometry (vocab={v_ck} dm={dm_ck} experts={}) != config (vocab={vocab} dm={dm} experts={e_n})", m.experts.len());
+                    anyhow::ensure!(v_ck == vocab && dm_ck == dm && m.n_experts() == e_n,
+                        "RESUME: checkpoint geometry (vocab={v_ck} dm={dm_ck} experts={}) != config (vocab={vocab} dm={dm} experts={e_n})", m.n_experts());
                     println!("[lm]   RESUMED from {p} — continuing training, not restarting");
                     (s, m)
                 }
-                _ => (Stored::new(&cm, vocab, &dev)?, Moe::new(dm, dff, e_n, &dev)?),
+                _ => (Stored::new(&cm, vocab, &dev)?, Moe::new_l(dm, dff, e_n, layers, &dev)?),
             };
             let mut vm = stm.vars(); vm.extend(moe.vars());
             let mut opt = AdamW::new(vm, ParamsAdamW { lr, ..Default::default() })?;
@@ -1933,12 +1969,12 @@ fn main() -> Result<()> {
         let moe_fp32 = eval_bpb_moe(test_s, tb, &stm, &moe, dm, l, &dev)?;
         // flatten experts into forward_moe_gen's layout, then int8 the mass
         let mut exflat: Vec<f32> = Vec::new();
-        for ex in &moe.experts {
+        for ex in moe.experts() {
             for var in [&ex.w1, &ex.b1, &ex.w2, &ex.b2] { exflat.extend(var.as_tensor().flatten_all()?.to_vec1::<f32>()?); }
         }
         let moe_ffn = exflat.len();
         let ex_q = Tensor::from_vec(fake_quant_vec(&exflat, 8), (moe_ffn,), &dev)?;
-        let moe_int8 = eval_bpb_moe_gen(test_s, tb, &stm, moe.gate.as_tensor(), &ex_q, dm, dff, e_n, l, &dev)?;
+        let moe_int8 = eval_bpb_moe_gen(test_s, tb, &stm, moe.gate().as_tensor(), &ex_q, dm, dff, e_n, l, &dev)?;
 
         // dense-big (E·dff)
         let cb = Cfg { dm, dff: e_n * dff, layers: 1 };
