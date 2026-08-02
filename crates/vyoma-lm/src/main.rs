@@ -1390,8 +1390,22 @@ fn main() -> Result<()> {
         if run_moe {
             // MoE: E experts of dff, top-1 routing + load-balance aux.
             let cm = Cfg { dm, dff, layers: 1 };
-            let stm = Stored::new(&cm, vocab, &dev)?;
-            let moe = Moe::new(dm, dff, e_n, &dev)?;
+            // RESUME=1 continues from the SAVE checkpoint if it exists, instead of
+            // starting from random weights. Cloud sessions are ephemeral; without
+            // this, every restart threw away all prior training and the 30 hours of
+            // Kaggle time never accumulated. Geometry is checked against the current
+            // config so a mismatched checkpoint fails loudly rather than silently.
+            let resume = std::env::var("RESUME").is_ok();
+            let (stm, moe) = match (resume, std::env::var("SAVE").ok()) {
+                (true, Some(p)) if std::path::Path::new(&p).exists() => {
+                    let (s, m, v_ck, dm_ck) = load_moe_ckpt(&p, &dev)?;
+                    anyhow::ensure!(v_ck == vocab && dm_ck == dm && m.experts.len() == e_n,
+                        "RESUME: checkpoint geometry (vocab={v_ck} dm={dm_ck} experts={}) != config (vocab={vocab} dm={dm} experts={e_n})", m.experts.len());
+                    println!("[lm]   RESUMED from {p} — continuing training, not restarting");
+                    (s, m)
+                }
+                _ => (Stored::new(&cm, vocab, &dev)?, Moe::new(dm, dff, e_n, &dev)?),
+            };
             let mut vm = stm.vars(); vm.extend(moe.vars());
             let mut opt = AdamW::new(vm, ParamsAdamW { lr, ..Default::default() })?;
             let mut rng = StdRng::seed_from_u64(0);
