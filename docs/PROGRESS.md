@@ -34,6 +34,7 @@ docs (`docs/english/`) stay stable, this file moves.
 | BPE on FineWeb (`vyoma-tokenizer` fineweb) | ✅ **−30% BPB** (2.797→1.936 dense-small; MoE 1.912 best-on-FineWeb) — biggest single lever, confirmed on real web text. MoE edge shrinks +0.120→+0.024 **mechanistically**: at vocab 4096 embed+head = ~89% of params, so FFN (where MoE acts) is only ~11% — same effect, diluted. Fix = grow DFF |
 | **FineWeb 30k-step runs** | ✅✅ **BPB 1.768 (4 exp) / 1.701 (16 exp)** — 4x experts, 2x params, better BPB at **identical active compute** (3.547M vs 3.552M). Writes real English. The mission thesis, measured on real web text |
 | Instruction tuning (`SFT=1`, `CHAT=1`) | ⚠️ format learned (emits `<|assistant|>`, stops at `<|end|>`), semantics NOT — out-of-distribution prompts get randomly-recalled answers. 462K params on 126 pairs; needs scale |
+| Data ceiling (reproduced) | ✅ capacity stops paying past ~32 experts on 60 MB and ~64 on 500 MB (128 exp adds 0.001). Each corpus supports a fixed capacity; more data raises the ceiling. Active compute flat (+1%) across 3.4× params |
 | Data unlocks capacity | ✅ 2.5× corpus grows the 32→64 expert gap **0.003 → 0.023 (~8×)**. The earlier plateau was data starvation, not an architectural ceiling. (Cross-corpus absolute BPB is test-shift confounded — compare gaps, not levels) |
 | Expert-count scaling | ✅ 4/16/32/64 experts on FineWeb: BPB **1.768/1.701/1.687/1.684** — 6× params for 0.65% more active compute. Returns collapse past ~32 (data-bound at 60M tokens) |
 | int8 / int4 quantization | ✅ measured cost: int8 **+0.01%**, int4 **+0.09%** BPB. Trillion-class working set **1.98 → 0.59 → 0.48 GB**. Our own kernel (threaded, stdlib) — candle has no int8 dtype |
@@ -69,6 +70,43 @@ stays honest.
 ---
 
 ## Log
+
+### 2026-08-02 — 500 MB expert curve completes: the data ceiling is real and reproducible
+
+**Result (500 MB FineWeb, 40 k steps, dm=384, dff=512).**
+
+| experts | BPB | gap vs previous | total params | active params |
+|---|---|---|---|---|
+| 32 | 1.947 | — | 15.8 M | 3.558 M |
+| 64 | 1.924 | **0.023** | 28.4 M | 3.570 M |
+| 128 | 1.923 | **0.001** | 53.6 M | 3.595 M |
+
+**Capacity stops paying at ~64 experts on this corpus.** Doubling 64→128 bought
+0.001 bits/byte — nothing — exactly as 32→64 bought nothing (0.003) on the smaller
+60 MB corpus. The pattern is consistent and now measured twice:
+
+| corpus | where the gap collapses |
+|---|---|
+| 60 MB | past ~32 experts |
+| 500 MB | past ~64 experts |
+
+**Each corpus size supports a certain capacity and no more.** More data raises the
+ceiling (2.5× data roughly doubled the useful expert count and grew the payoff 8×);
+more experts beyond it are dead weight. This is Chinchilla stated in expert-count
+terms, on our own architecture, and it means "add experts" is only a lever while
+data grows with it — which is precisely the honest form of the trillion-parameter
+claim.
+
+**Active compute stayed flat throughout**: 3.558 M → 3.595 M (+1%) across a 3.4×
+increase in total parameters. The sparsity property holds regardless of whether the
+extra capacity is *useful* — a useful separation, since it means the memory
+architecture is not what limits us.
+
+**Open question now running:** the same parameter budget spent on DEPTH instead of
+width — 32 experts × 4 layers (~60 M params) against 128 experts × 1 layer (53.6 M,
+BPB 1.923). Depth only became possible today; until this morning the whole model
+was one block deep.
+
 
 ### 2026-08-02 — More data makes capacity pay: the expert gap grows 8× on a 2.5× larger corpus ✅
 
