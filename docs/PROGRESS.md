@@ -34,6 +34,7 @@ docs (`docs/english/`) stay stable, this file moves.
 | BPE on FineWeb (`vyoma-tokenizer` fineweb) | ✅ **−30% BPB** (2.797→1.936 dense-small; MoE 1.912 best-on-FineWeb) — biggest single lever, confirmed on real web text. MoE edge shrinks +0.120→+0.024 **mechanistically**: at vocab 4096 embed+head = ~89% of params, so FFN (where MoE acts) is only ~11% — same effect, diluted. Fix = grow DFF |
 | **FineWeb 30k-step runs** | ✅✅ **BPB 1.768 (4 exp) / 1.701 (16 exp)** — 4x experts, 2x params, better BPB at **identical active compute** (3.547M vs 3.552M). Writes real English. The mission thesis, measured on real web text |
 | Instruction tuning (`SFT=1`, `CHAT=1`) | ⚠️ format learned (emits `<|assistant|>`, stops at `<|end|>`), semantics NOT — out-of-distribution prompts get randomly-recalled answers. 462K params on 126 pairs; needs scale |
+| Depth vs width | ❌ at matched 53.6M params, **4 layers × 32 exp = 2.002 BPB vs 1 layer × 128 exp = 1.923** — depth loses, and loses to the half-size 64-exp model too. Third independent observation that width is this architecture's productive axis. 80k-step continuation testing the undertrained hypothesis |
 | Data ceiling (reproduced) | ✅ capacity stops paying past ~32 experts on 60 MB and ~64 on 500 MB (128 exp adds 0.001). Each corpus supports a fixed capacity; more data raises the ceiling. Active compute flat (+1%) across 3.4× params |
 | Data unlocks capacity | ✅ 2.5× corpus grows the 32→64 expert gap **0.003 → 0.023 (~8×)**. The earlier plateau was data starvation, not an architectural ceiling. (Cross-corpus absolute BPB is test-shift confounded — compare gaps, not levels) |
 | Expert-count scaling | ✅ 4/16/32/64 experts on FineWeb: BPB **1.768/1.701/1.687/1.684** — 6× params for 0.65% more active compute. Returns collapse past ~32 (data-bound at 60M tokens) |
@@ -70,6 +71,44 @@ stays honest.
 ---
 
 ## Log
+
+### 2026-08-02 — Depth LOSES to width at matched parameters (hypothesis refuted)
+
+**What.** Multi-layer support was added after discovering the entire model had been
+one block deep. The hypothesis was that missing depth explained why generation reads
+fluently but never holds an idea — depth is what lets a model compose abstractions.
+Direct test: spend the same parameter budget on depth instead of width.
+
+**Result (500 MB FineWeb, 40 k steps, dm=384, dff=512).**
+
+| config | total params | active params | BPB |
+|---|---|---|---|
+| 64 experts × 1 layer | 28.4 M | 3.570 M | **1.917** |
+| 128 experts × 1 layer | 53.6 M | 3.595 M | **1.923** |
+| **32 experts × 4 layers** | **53.65 M** | 3.562 M | **2.002** |
+
+At a matched 53.6 M parameters, **depth is 0.079 BPB worse than width** — and worse
+than the half-sized 64-expert single-layer model. The hypothesis is refuted at this
+scale and training budget.
+
+**This is consistent with earlier findings, which I should have weighted more.** The
+language-model arc already showed depth failing to unlock generative weights
+(1→2→4 layers gave ≈0, +1.3, +0.5–0.9 pts) while *width* moved the needle, and a
+small local test here showed 4 layers worse than 2. Three independent observations
+now point the same way: for this architecture, **width is the productive axis and
+depth is not.**
+
+**Caveat being tested.** Deeper models typically need more optimisation steps, so
+40 k may simply undertrain 4 layers. A continuation to 80 k steps is running. If
+BPB drops below 1.923 the conclusion becomes "depth needs more compute"; if it
+plateaus above, width wins outright at this scale.
+
+**Why it matters.** Width was already exhausted on this corpus (128 experts bought
+0.001 over 64). If depth also fails, then neither shape lever is available and the
+remaining lever is unambiguously **data** — which is exactly what the data-ceiling
+curve says. It also means the incoherence of generated text is not a missing-depth
+problem, and a different explanation is required.
+
 
 ### 2026-08-02 — 500 MB expert curve completes: the data ceiling is real and reproducible
 
