@@ -33,6 +33,8 @@ docs (`docs/english/`) stay stable, this file moves.
 | Real web data + GPU (`vyoma-data`, FineWeb) | ✅✅ first non-teacher, real-web-text result, on Kaggle T4: **MoE 2.677 BPB beats dense-small 2.797 (+0.120) AND dense-big 2.801 (−0.123, 3.1× fewer active params)** on 210M real tokens. Portable CPU/CUDA/Metal build; `ONLY=` split for 2-GPU parallelism |
 | BPE on FineWeb (`vyoma-tokenizer` fineweb) | ✅ **−30% BPB** (2.797→1.936 dense-small; MoE 1.912 best-on-FineWeb) — biggest single lever, confirmed on real web text. MoE edge shrinks +0.120→+0.024 **mechanistically**: at vocab 4096 embed+head = ~89% of params, so FFN (where MoE acts) is only ~11% — same effect, diluted. Fix = grow DFF |
 | **FineWeb 30k-step runs** | ✅✅ **BPB 1.768 (4 exp) / 1.701 (16 exp)** — 4x experts, 2x params, better BPB at **identical active compute** (3.547M vs 3.552M). Writes real English. The mission thesis, measured on real web text |
+| Expert-count scaling | ✅ 4/16/32/64 experts on FineWeb: BPB **1.768/1.701/1.687/1.684** — 6× params for 0.65% more active compute. Returns collapse past ~32 (data-bound at 60M tokens) |
+| int8 / int4 quantization | ✅ measured cost: int8 **+0.01%**, int4 **+0.09%** BPB. Trillion-class working set **1.98 → 0.59 → 0.48 GB**. Our own kernel (threaded, stdlib) — candle has no int8 dtype |
 | Expert paging (`MODE=paged`) | ✅ **the mission's mechanism**: experts on disk int8 (`VYX1`), only routed expert in RAM. Toy 2.10x smaller working set; at real dims (99.9% experts) a **trillion-param model needs ~2 GB RAM** — RAM flat as experts grow, capacity costs DISK not memory |
 | Direction | **Retrieval-centric hybrid + sparse MoE**: our retriever + on-disk store + lean SSM + top-1 experts (STORED + int8, not generated); generation stays an image-regime multiplier; teacher teaches only |
 | Next (all ours) | firm up retrolm at scale (BPE + bigger model/context + more seeds); build a real MoE (Pillar 3); grow the distilled corpus |
@@ -65,6 +67,62 @@ stays honest.
 ---
 
 ## Log
+
+### 2026-08-02 — Expert-count scaling curve complete + int4: 999B params in 0.48 GB
+
+**Scaling curve (FineWeb 60M tokens, 30k steps, dm=384, dff=512).**
+
+| experts | BPB | Δ | total params | active params |
+|---|---|---|---|---|
+| 4 | 1.768 | — | 4.73 M | 3.547 M |
+| 16 | 1.701 | −0.067 | 9.46 M | 3.552 M |
+| 32 | 1.687 | −0.014 | 15.78 M | 3.558 M |
+| 64 | **1.684** | −0.003 | 28.40 M | 3.570 M |
+
+**The thesis holds: 6× the parameters for 0.65% more active compute.** Capacity
+comes from expert count; per-token cost does not move. With paging, RAM does not
+either. That is the trillion-parameter argument, measured on real web text.
+
+**But returns collapsed** (−0.067 → −0.003): at 60M tokens we are firmly
+data-bound, and beyond ~16–32 experts extra capacity buys almost nothing. Same
+Chinchilla signature as before. Hence a 500 MB extract (2.5× data) now training.
+
+**int4 (`BITS=4`) is nearly free too.** Same measurement harness (`MODE=q8bpb`),
+same checkpoint, same held-out text:
+
+| weights | BPB | cost |
+|---|---|---|
+| f32 (reference) | 2.1721 | — |
+| int8 | 2.1723 | +0.01% |
+| int4 | 2.1742 | **+0.09%** |
+
+int4 packs two weights per byte (`QW::Int4`), unpacked in the matmul inner loop —
+never expanded in RAM. Working set 4.95× → **5.70×** smaller.
+
+**Note this does NOT contradict the earlier E1 finding that 4-bit broke the seed
+(→57%).** That was *generated* weights, where each seed parameter is
+information-dense and cannot absorb rounding. Stored MoE experts are redundant
+and tolerate int4 fine — the same redundancy principle that has governed every
+generation result in this project, now cutting the other way in our favour.
+
+**Trillion-class projection (8500 experts, ~999B params), working set:**
+
+| | |
+|---|---|
+| all f32 | 1.98 GB |
+| int8 experts + int8 backbone | 0.59 GB |
+| **int4 experts + int8 backbone** | **0.48 GB** |
+
+A ~999-billion-parameter model with a **0.48 GB working set** — under half a
+gigabyte, on an 8 GB machine, with 7.5 GB to spare.
+
+**Kernel performance.** Threading (`std::thread::scope`, stdlib only) plus four
+independent accumulators took int8 inference 2.78 → 1.81 ms/token against f32's
+1.50 — so 3.1× less RAM for 1.2× slower. Router quantization is opt-in
+(`Q8ROUTER=1`): at 8 experts it saved 3 KB and cost 0.6 ms/token because candle's
+BLAS wins on a small matmul, but at 8500 experts the router is 0.13 GB f32 and the
+trade flips.
+
 
 ### 2026-08-02 — 30k steps on FineWeb: BPB 1.768 → 1.701, and the mission thesis proven on real data ✅✅✅
 

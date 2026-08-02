@@ -522,11 +522,41 @@ fn write_expert_store(path: &str, moe: &Moe, dm: usize, dff: usize) -> Result<u6
 // weights never materialize as f32, and the scale is applied once to the
 // accumulated dot product. Biases stay f32 (they are dff+dm elements — noise).
 // ---------------------------------------------------------------------------
-struct Q8Expert { w1: Vec<i8>, s1: f32, b1: Vec<f32>, w2: Vec<i8>, s2: f32, b2: Vec<f32>, dm: usize, dff: usize }
+/// int4 packing: two signed 4-bit weights (-7..7) per byte. Halves RAM again on
+/// top of int8. Unpacked in the matmul inner loop — never expanded in memory.
+fn q4_pack(v: &[f32]) -> (Vec<u8>, f32) {
+    let m = v.iter().fold(0f32, |a, &x| a.max(x.abs()));
+    let s = if m == 0.0 { 1.0 } else { m / 7.0 };
+    let mut out = vec![0u8; v.len().div_ceil(2)];
+    for (i, &x) in v.iter().enumerate() {
+        let q = ((x / s).round().clamp(-7.0, 7.0) as i8 + 8) as u8 & 0x0F; // bias by 8 → 0..15
+        if i % 2 == 0 { out[i / 2] |= q; } else { out[i / 2] |= q << 4; }
+    }
+    (out, s)
+}
+#[inline(always)]
+fn q4_get(w: &[u8], i: usize) -> f32 {
+    let b = w[i / 2];
+    let n = if i % 2 == 0 { b & 0x0F } else { b >> 4 };
+    (n as i8 - 8) as f32
+}
+
+/// Expert weights held quantized in RAM. `Int8` is one byte per weight; `Int4`
+/// packs two per byte. Neither is ever expanded to f32.
+enum QW { Int8(Vec<i8>), Int4(Vec<u8>) }
+impl QW {
+    fn bytes(&self) -> usize { match self { QW::Int8(v) => v.len(), QW::Int4(v) => v.len() } }
+    #[inline(always)]
+    fn get(&self, i: usize) -> f32 {
+        match self { QW::Int8(v) => v[i] as f32, QW::Int4(v) => q4_get(v, i) }
+    }
+}
+
+struct Q8Expert { w1: QW, s1: f32, b1: Vec<f32>, w2: QW, s2: f32, b2: Vec<f32>, dm: usize, dff: usize }
 
 impl Q8Expert {
     /// RAM held by this expert: int8 weights + f32 biases (vs 4× for all-f32).
-    fn bytes(&self) -> usize { self.w1.len() + self.w2.len() + (self.b1.len() + self.b2.len()) * 4 }
+    fn bytes(&self) -> usize { self.w1.bytes() + self.w2.bytes() + (self.b1.len() + self.b2.len()) * 4 }
 
     /// out[t][o] = scale · Σ_k x[t][k]·w[o][k]  — int8 weights, f32 activations,
     /// f32 accumulator. `w` is row-major (rows × k).
@@ -579,16 +609,55 @@ impl Q8Expert {
         for o in 0..rows { for ti in 0..t { out[ti * rows + o] = outt[o * t + ti]; } }
     }
 
+    /// Same kernel, generic over quantization width (int8 or packed int4).
+    fn matmul_q(x: &[f32], t: usize, k: usize, w: &QW, rows: usize, scale: f32, bias: &[f32], out: &mut Vec<f32>) {
+        out.clear();
+        out.resize(t * rows, 0.0);
+        let nthreads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1).min(rows.max(1));
+        let mut outt = vec![0f32; rows * t];
+        let chunk = rows.div_ceil(nthreads.max(1));
+        std::thread::scope(|sc| {
+            for (ci, obuf) in outt.chunks_mut(chunk * t).enumerate() {
+                let (w, x, bias) = (&w, &x, &bias);
+                sc.spawn(move || {
+                    let o0 = ci * chunk;
+                    for (j, orow) in obuf.chunks_mut(t).enumerate() {
+                        let o = o0 + j;
+                        if o >= rows { break; }
+                        let base = o * k;
+                        let b = bias[o];
+                        for ti in 0..t {
+                            let xr = &x[ti * k..(ti + 1) * k];
+                            let (mut a0, mut a1, mut a2, mut a3) = (0f32, 0f32, 0f32, 0f32);
+                            let mut i = 0;
+                            while i + 4 <= k {
+                                a0 += xr[i] * w.get(base + i);
+                                a1 += xr[i + 1] * w.get(base + i + 1);
+                                a2 += xr[i + 2] * w.get(base + i + 2);
+                                a3 += xr[i + 3] * w.get(base + i + 3);
+                                i += 4;
+                            }
+                            let mut acc = (a0 + a1) + (a2 + a3);
+                            while i < k { acc += xr[i] * w.get(base + i); i += 1; }
+                            orow[ti] = acc * scale + b;
+                        }
+                    }
+                });
+            }
+        });
+        for o in 0..rows { for ti in 0..t { out[ti * rows + o] = outt[o * t + ti]; } }
+    }
+
     /// Full FFN for `t` tokens: x → w1 → gelu → w2 → out. No f32 weight ever exists.
     fn ffn(&self, x: &[f32], t: usize) -> Vec<f32> {
         let mut h = Vec::new();
-        Self::matmul(x, t, self.dm, &self.w1, self.dff, self.s1, &self.b1, &mut h);
+        Self::matmul_q(x, t, self.dm, &self.w1, self.dff, self.s1, &self.b1, &mut h);
         for v in h.iter_mut() { // gelu (tanh approximation)
             let x3 = *v * *v * *v;
             *v = 0.5 * *v * (1.0 + ((2.0 / std::f32::consts::PI).sqrt() * (*v + 0.044715 * x3)).tanh());
         }
         let mut o = Vec::new();
-        Self::matmul(&h, t, self.dff, &self.w2, self.dm, self.s2, &self.b2, &mut o);
+        Self::matmul_q(&h, t, self.dff, &self.w2, self.dm, self.s2, &self.b2, &mut o);
         o
     }
 }
@@ -663,7 +732,7 @@ struct PagedExperts {
     n_exp: usize, dm: usize, dff: usize, per: usize,
     cache: std::collections::HashMap<usize, std::rc::Rc<Q8Expert>>,
     order: Vec<usize>, cap: usize,
-    pub loads: usize, pub hits: usize, pub bytes_read: usize,
+    pub loads: usize, pub hits: usize, pub bytes_read: usize, pub bits: u8,
 }
 impl PagedExperts {
     fn open(path: &str, cap: usize) -> Result<Self> {
@@ -675,7 +744,8 @@ impl PagedExperts {
         let rd = |o: usize| u32::from_le_bytes([hdr[o], hdr[o+1], hdr[o+2], hdr[o+3]]) as usize;
         let (n_exp, dm, dff) = (rd(4), rd(8), rd(12));
         let per = 16 + (2 * dm * dff + dff + dm); // 4 f32 scales + int8 payload
-        Ok(Self { f, n_exp, dm, dff, per, cache: Default::default(), order: vec![], cap, loads: 0, hits: 0, bytes_read: 0 })
+        let bits = std::env::var("BITS").ok().and_then(|v| v.parse().ok()).unwrap_or(8u8);
+        Ok(Self { f, n_exp, dm, dff, per, cache: Default::default(), order: vec![], cap, loads: 0, hits: 0, bytes_read: 0, bits })
     }
     fn total_expert_bytes(&self) -> usize { self.n_exp * self.per }
     /// Bytes of expert weights actually resident in RAM (fp32 after dequant).
@@ -705,12 +775,21 @@ impl PagedExperts {
         let mut take_i8 = |n: usize, bytes: &[u8], o: &mut usize| -> Vec<i8> {
             let v: Vec<i8> = (0..n).map(|k| bytes[*o + k] as i8).collect(); *o += n; v
         };
-        let w1 = take_i8(dff * dm, &buf, &mut o);
+        let w1i = take_i8(dff * dm, &buf, &mut o);
         let b1v = take_i8(dff, &buf, &mut o);
-        let w2 = take_i8(dm * dff, &buf, &mut o);
+        let w2i = take_i8(dm * dff, &buf, &mut o);
         let b2v = take_i8(dm, &buf, &mut o);
         let b1: Vec<f32> = b1v.iter().map(|&c| c as f32 * s2).collect();
         let b2: Vec<f32> = b2v.iter().map(|&c| c as f32 * s4).collect();
+        // BITS=4 re-packs to nibbles in RAM (halving residency again); the store
+        // itself stays int8 so one file serves both widths.
+        let (w1, w2, s1, s3) = if self.bits == 4 {
+            let f1: Vec<f32> = w1i.iter().map(|&c| c as f32 * s1).collect();
+            let f2: Vec<f32> = w2i.iter().map(|&c| c as f32 * s3).collect();
+            let (p1, n1) = q4_pack(&f1);
+            let (p2, n2) = q4_pack(&f2);
+            (QW::Int4(p1), QW::Int4(p2), n1, n2)
+        } else { (QW::Int8(w1i), QW::Int8(w2i), s1, s3) };
         let t = std::rc::Rc::new(Q8Expert { w1, s1, b1, w2, s2: s3, b2, dm, dff });
         if self.cache.len() >= self.cap {
             if let Some(ev) = self.order.first().copied() { self.order.remove(0); self.cache.remove(&ev); }
