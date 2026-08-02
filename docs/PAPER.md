@@ -124,6 +124,20 @@ FineWeb, 60 MB, 30k steps, d_model=384, d_ff=512:
 
 A 6× increase in total parameters costs **0.65%** additional active parameters.
 
+### 4.1b Depth versus width at matched parameters
+
+500 MB corpus, 40k steps, ~53.6 M parameters in every row:
+
+| config | BPB |
+|---|---|
+| 64 experts × 1 layer (28.4 M) | 1.917 |
+| 128 experts × 1 layer | 1.923 |
+| **64 experts × 2 layers** | **1.898** |
+| 32 experts × 4 layers | 2.002 |
+
+Depth is non-monotonic with an optimum at 2 layers for this budget. Width alone is
+exhausted (128 vs 64 experts differ by 0.001); shallow-and-wide is not optimal.
+
 ### 4.2 The data ceiling
 
 Extending to a 500 MB corpus (40k steps):
@@ -245,8 +259,16 @@ instruction pairs and 462K parameters, the model correctly emits turn markers an
 stops appropriately, but out-of-distribution prompts retrieve unrelated memorised
 answers ("What is a submarine?" → an answer about fossils).
 
-**5.5 Depth was absent.** Until late in this work the entire model was one block
-deep. Multi-layer support has since been implemented; evaluation at scale is ongoing.
+**5.5 Depth has an optimum, and a premature conclusion was published.** Until late
+in this work the entire model was one block deep. With multi-layer support, at a
+matched ~53.6 M parameters: 2 layers × 64 experts reaches **1.898 BPB** (best result
+in this work), 1 layer × 128 experts 1.923, and 4 layers × 32 experts 2.002. The
+curve is non-monotonic — some depth helps, more hurts at fixed optimisation budget.
+
+We record a process failure alongside it: the conclusion "depth loses to width" was
+written and committed from the 4-layer point alone while the 2-layer run was still
+training, and had to be retracted. Single-sample curves should not be published,
+particularly when the remaining samples are already in flight.
 
 ---
 

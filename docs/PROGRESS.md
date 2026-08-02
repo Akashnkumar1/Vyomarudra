@@ -34,7 +34,7 @@ docs (`docs/english/`) stay stable, this file moves.
 | BPE on FineWeb (`vyoma-tokenizer` fineweb) | ✅ **−30% BPB** (2.797→1.936 dense-small; MoE 1.912 best-on-FineWeb) — biggest single lever, confirmed on real web text. MoE edge shrinks +0.120→+0.024 **mechanistically**: at vocab 4096 embed+head = ~89% of params, so FFN (where MoE acts) is only ~11% — same effect, diluted. Fix = grow DFF |
 | **FineWeb 30k-step runs** | ✅✅ **BPB 1.768 (4 exp) / 1.701 (16 exp)** — 4x experts, 2x params, better BPB at **identical active compute** (3.547M vs 3.552M). Writes real English. The mission thesis, measured on real web text |
 | Instruction tuning (`SFT=1`, `CHAT=1`) | ⚠️ format learned (emits `<|assistant|>`, stops at `<|end|>`), semantics NOT — out-of-distribution prompts get randomly-recalled answers. 462K params on 126 pairs; needs scale |
-| Depth vs width | ❌ at matched 53.6M params, **4 layers × 32 exp = 2.002 BPB vs 1 layer × 128 exp = 1.923** — depth loses, and loses to the half-size 64-exp model too. Third independent observation that width is this architecture's productive axis. 80k-step continuation testing the undertrained hypothesis |
+| Depth vs width | ✅ depth has an **optimum**: at matched 53.6M params, **2 layers × 64 exp = 1.898 BPB (best ever)** > 1 layer × 128 exp = 1.923 > 4 layers × 32 exp = 2.002. Some depth helps, too much hurts at this training budget |
 | Data ceiling (reproduced) | ✅ capacity stops paying past ~32 experts on 60 MB and ~64 on 500 MB (128 exp adds 0.001). Each corpus supports a fixed capacity; more data raises the ceiling. Active compute flat (+1%) across 3.4× params |
 | Data unlocks capacity | ✅ 2.5× corpus grows the 32→64 expert gap **0.003 → 0.023 (~8×)**. The earlier plateau was data starvation, not an architectural ceiling. (Cross-corpus absolute BPB is test-shift confounded — compare gaps, not levels) |
 | Expert-count scaling | ✅ 4/16/32/64 experts on FineWeb: BPB **1.768/1.701/1.687/1.684** — 6× params for 0.65% more active compute. Returns collapse past ~32 (data-bound at 60M tokens) |
@@ -72,7 +72,42 @@ stays honest.
 
 ## Log
 
-### 2026-08-02 — Depth LOSES to width at matched parameters (hypothesis refuted)
+### 2026-08-02 — CORRECTION: depth has an optimum; 2 layers is our best model yet
+
+**I published the wrong conclusion one entry below, and this corrects it.** That
+entry ("Depth LOSES to width") was written from the 4-layer data point while the
+2-layer run was still training. The 2-layer result inverts it.
+
+**Full curve at matched parameters (500 MB FineWeb, 40 k steps, dm=384, dff=512):**
+
+| config | total params | active | BPB |
+|---|---|---|---|
+| 64 experts × 1 layer | 28.4 M | 3.570 M | 1.917 |
+| 128 experts × 1 layer | 53.6 M | 3.595 M | 1.923 |
+| **64 experts × 2 layers** | **53.65 M** | 3.572 M | **1.898** ← best result to date |
+| 32 experts × 4 layers | 53.65 M | 3.562 M | 2.002 |
+
+**Depth is not harmful — it has an optimum.** Two layers beats every single-layer
+configuration, including one with twice the experts. Four layers is worst. The curve
+is non-monotonic, which is the classic depth-versus-optimisation-budget tradeoff:
+depth adds representational composition but costs trainability, and past some point
+the second effect dominates at fixed steps.
+
+**What I got wrong and why it matters.** I concluded "width is the productive axis"
+from a single point, and reinforced it by pointing at two earlier observations that
+happened to agree. Had the 2-layer run finished first I would have concluded the
+opposite. The lesson is procedural, not technical: *do not publish a curve from one
+sample*, especially when the remaining samples are already running. The earlier
+entry is left in place rather than deleted, with this correction above it.
+
+**Revised design guidance.** Best known configuration is now **2 layers × 64
+experts**. Width alone is exhausted on this corpus (128 vs 64 experts at 1 layer:
+0.001 BPB); shallow-and-wide is not optimal either; a modest amount of depth is.
+The 4-layer 80 k-step continuation still tests whether deeper models simply need
+more optimisation — if 4 layers falls below 1.898 with double the steps, the
+optimum is budget-dependent rather than architectural.
+
+### 2026-08-02 — Depth LOSES to width (SUPERSEDED — see correction above) at matched parameters (hypothesis refuted)
 
 **What.** Multi-layer support was added after discovering the entire model had been
 one block deep. The hypothesis was that missing depth explained why generation reads
