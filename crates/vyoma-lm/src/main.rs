@@ -1371,9 +1371,12 @@ fn main() -> Result<()> {
 
     // --- assemble corpus (+ vocab, + optional answer mask) ---
     let tok = std::env::var("TOKENIZER").unwrap_or_else(|_| "char".into());
-    let (corpus, vocab, amask): (Vec<u32>, usize, Vec<bool>) = if dataset == "text" || dataset == "distilled" || dataset == "fineweb" {
-        // fineweb.txt is produced by `vyoma-data` from a FineWeb parquet shard.
-        let file = match dataset.as_str() { "distilled" => "distilled.txt", "fineweb" => "fineweb.txt", _ => "tinyshakespeare.txt" };
+    let (corpus, vocab, amask): (Vec<u32>, usize, Vec<bool>) = if dataset == "text" || dataset == "distilled" || dataset == "fineweb" || dataset == "sft" {
+        // fineweb.txt from `vyoma-data`; sft.txt from `vyoma-distill SFT=1`
+        // (instruction/response pairs with <|user|> / <|assistant|> turn markers).
+        let file = match dataset.as_str() {
+            "distilled" => "distilled.txt", "fineweb" => "fineweb.txt",
+            "sft" => "sft.txt", _ => "tinyshakespeare.txt" };
         let dir = env!("CARGO_MANIFEST_DIR");
         let path = format!("{dir}/data_cache/{file}");
         let (s, v) = if tok == "bpe" {

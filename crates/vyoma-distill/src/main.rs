@@ -69,12 +69,62 @@ fn ask(agent: &ureq::Agent, prompt: &str, tries: usize) -> Result<String> {
     Err(last)
 }
 
+/// Instruction-tuning corpus. Our LM only ever learned to CONTINUE text, so "hi"
+/// produced "hirest;" rather than a reply — it has no notion of a turn. Here the
+/// teacher writes (instruction, response) PAIRS, which we wrap in explicit turn
+/// markers so OUR model learns the shape of a conversation. The teacher supplies
+/// training data only; it is never part of Vyomarudra.
+const SFT_USER: &str = "<|user|>";
+const SFT_ASSISTANT: &str = "<|assistant|>";
+const SFT_END: &str = "<|end|>";
+
+fn instructions() -> Vec<&'static str> {
+    vec![
+        "Explain {} in two sentences.", "What is {}?", "Give a simple example of {}.",
+        "Why does {} matter?", "How would you describe {} to a child?",
+        "List two facts about {}.", "What is one common misconception about {}?",
+        "Summarise {} briefly.",
+    ]
+}
+
 fn main() -> Result<()> {
     let count: usize = std::env::var("COUNT").ok().and_then(|s| s.parse().ok()).unwrap_or(200);
     let append = std::env::var("APPEND").is_ok();
+    let sft = std::env::var("SFT").is_ok();
     let agent = ureq::AgentBuilder::new().timeout(Duration::from_secs(180)).build();
-    let out = format!("{}/../vyoma-lm/data_cache/distilled.txt", env!("CARGO_MANIFEST_DIR"));
+    let out = if sft {
+        format!("{}/../vyoma-lm/data_cache/sft.txt", env!("CARGO_MANIFEST_DIR"))
+    } else {
+        format!("{}/../vyoma-lm/data_cache/distilled.txt", env!("CARGO_MANIFEST_DIR"))
+    };
     std::fs::create_dir_all(std::path::Path::new(&out).parent().unwrap())?;
+
+    if sft {
+        // (instruction, response) pairs wrapped in turn markers
+        let (topics, instrs) = (topics(), instructions());
+        println!("[distill] SFT mode: teacher writes instruction/response pairs → {out}");
+        let mut f = std::fs::OpenOptions::new().create(true).write(true).append(append).truncate(!append).open(&out)?;
+        let mut total = 0usize;
+        for i in 0..count {
+            let topic = topics[i % topics.len()];
+            let instr = instrs[(i / topics.len()) % instrs.len()].replace("{}", topic);
+            let ask_prompt = format!("{instr}\nAnswer directly and concisely, no preamble.");
+            let reply = match ask(&agent, &ask_prompt, 3) {
+                Ok(t) => t,
+                Err(e) => { eprintln!("[distill] skip {i}: {e}"); continue; }
+            };
+            let rec = format!("{SFT_USER}\n{instr}\n{SFT_ASSISTANT}\n{}\n{SFT_END}\n\n", reply.trim());
+            write!(f, "{rec}")?;
+            f.flush()?;
+            total += rec.len();
+            if i % 10 == 0 || i + 1 == count {
+                println!("[distill] {:3}/{count}  (+{} chars, {} total)", i + 1, rec.len(), total);
+            }
+        }
+        println!("\n[distill] done: {total} chars of instruction data → {out}");
+        println!("[distill] next: DATASET=sft TOKENIZER=bpe MODE=sft ./target/release/vyoma-lm");
+        return Ok(());
+    }
 
     let (topics, forms) = (topics(), forms());
     println!("[distill] teacher=phi4-mini → distilled corpus for OUR model ({count} generations, {} topics × {} forms)", topics.len(), forms.len());
