@@ -533,15 +533,50 @@ impl Q8Expert {
     fn matmul(x: &[f32], t: usize, k: usize, w: &[i8], rows: usize, scale: f32, bias: &[f32], out: &mut Vec<f32>) {
         out.clear();
         out.resize(t * rows, 0.0);
-        for ti in 0..t {
-            let xr = &x[ti * k..(ti + 1) * k];
-            for o in 0..rows {
-                let wr = &w[o * k..(o + 1) * k];
-                let mut acc = 0f32;
-                for i in 0..k { acc += xr[i] * wr[i] as f32; }
-                out[ti * rows + o] = acc * scale + bias[o];
+        // Two optimizations over the naive triple loop, because a scalar
+        // single-threaded kernel loses badly to candle's f32 BLAS:
+        //  1. FOUR independent accumulators — a single `acc` serializes on a
+        //     floating-point dependency chain (each add waits for the previous),
+        //     blocking pipelining/SIMD. Four partial sums break the chain.
+        //  2. THREADS over output rows, via std::thread::scope (stdlib, no new
+        //     dependency). We compute the TRANSPOSED result (rows × t) so each
+        //     thread owns a contiguous, disjoint slice, then transpose back — the
+        //     transpose is O(t·rows) against an O(t·rows·k) matmul, so it is noise.
+        let nthreads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1).min(rows.max(1));
+        let mut outt = vec![0f32; rows * t]; // (rows × t)
+        let row_dot = |xr: &[f32], wr: &[i8]| -> f32 {
+            let (mut a0, mut a1, mut a2, mut a3) = (0f32, 0f32, 0f32, 0f32);
+            let mut i = 0;
+            while i + 4 <= k {
+                a0 += xr[i] * wr[i] as f32;
+                a1 += xr[i + 1] * wr[i + 1] as f32;
+                a2 += xr[i + 2] * wr[i + 2] as f32;
+                a3 += xr[i + 3] * wr[i + 3] as f32;
+                i += 4;
             }
-        }
+            let mut acc = (a0 + a1) + (a2 + a3);
+            while i < k { acc += xr[i] * wr[i] as f32; i += 1; }
+            acc
+        };
+        let chunk = rows.div_ceil(nthreads.max(1));
+        std::thread::scope(|sc| {
+            for (ci, obuf) in outt.chunks_mut(chunk * t).enumerate() {
+                let (w, x, bias) = (&w, &x, &bias);
+                sc.spawn(move || {
+                    let o0 = ci * chunk;
+                    for (j, orow) in obuf.chunks_mut(t).enumerate() {
+                        let o = o0 + j;
+                        if o >= rows { break; }
+                        let wr = &w[o * k..(o + 1) * k];
+                        let b = bias[o];
+                        for ti in 0..t {
+                            orow[ti] = row_dot(&x[ti * k..(ti + 1) * k], wr) * scale + b;
+                        }
+                    }
+                });
+            }
+        });
+        for o in 0..rows { for ti in 0..t { out[ti * rows + o] = outt[o * t + ti]; } }
     }
 
     /// Full FFN for `t` tokens: x → w1 → gelu → w2 → out. No f32 weight ever exists.
@@ -568,20 +603,39 @@ impl Q8Expert {
 //   * head:  h @ woᵀ is exactly our (rows × k) int8 matmul shape — reused directly.
 // The SSM parameters stay f32: 4·dm per layer is noise.
 // ---------------------------------------------------------------------------
-struct Q8Backbone { embed: Vec<i8>, s_embed: f32, wo: Vec<i8>, s_wo: f32, bo: Vec<f32>, vocab: usize, dm: usize }
+struct Q8Backbone {
+    embed: Vec<i8>, s_embed: f32, wo: Vec<i8>, s_wo: f32, bo: Vec<f32>, vocab: usize, dm: usize,
+    /// Router, quantized and stored TRANSPOSED as (E × dm) so it matches the
+    /// (rows × k) layout our int8 matmul wants. At high expert counts this is the
+    /// largest remaining f32 block (0.13 GB at 8500 experts), so it gets the same
+    /// treatment as everything else.
+    gate: Vec<i8>, s_gate: f32, n_exp: usize,
+}
 
 impl Q8Backbone {
-    fn from_stored(st: &Stored) -> Result<Self> {
+    fn from_stored(st: &Stored, gate_t: &Tensor) -> Result<Self> {
         let e = st.embed.as_tensor();
         let (vocab, dm) = e.dims2()?;
         let ev = e.flatten_all()?.to_vec1::<f32>()?;
         let (ec, s_embed) = q8(&ev);
         let wv = st.wo.as_tensor().flatten_all()?.to_vec1::<f32>()?;
         let (wc, s_wo) = q8(&wv);
-        Ok(Self { embed: ec, s_embed, wo: wc, s_wo, bo: st.bo.as_tensor().flatten_all()?.to_vec1::<f32>()?, vocab, dm })
+        let (_dm_g, n_exp) = gate_t.dims2()?;
+        let gv = gate_t.t()?.contiguous()?.flatten_all()?.to_vec1::<f32>()?; // (E, dm)
+        let (gc, s_gate) = q8(&gv);
+        Ok(Self { embed: ec, s_embed, wo: wc, s_wo,
+                  bo: st.bo.as_tensor().flatten_all()?.to_vec1::<f32>()?, vocab, dm,
+                  gate: gc, s_gate, n_exp })
     }
-    /// RAM: two int8 vocab×dm tables + an f32 bias vector (vs 4× for all-f32).
-    fn bytes(&self) -> usize { self.embed.len() + self.wo.len() + self.bo.len() * 4 }
+    /// RAM: int8 embed + int8 head + int8 router + a small f32 bias vector.
+    fn bytes(&self) -> usize { self.embed.len() + self.wo.len() + self.gate.len() + self.bo.len() * 4 }
+    /// Router logits (n × E) from int8 gate weights.
+    fn route(&self, y: &[f32], n: usize) -> Vec<f32> {
+        let zeros = vec![0f32; self.n_exp];
+        let mut out = Vec::new();
+        Q8Expert::matmul(y, n, self.dm, &self.gate, self.n_exp, self.s_gate, &zeros, &mut out);
+        out
+    }
     /// Dequantize ONLY the rows actually looked up — the table itself stays int8.
     fn embed_rows(&self, ids: &[u32]) -> Vec<f32> {
         let mut out = vec![0f32; ids.len() * self.dm];
@@ -713,7 +767,17 @@ fn forward_q8(ids: &Tensor, bb: &Q8Backbone, ssm: &SsmLayer, gate: &Tensor,
     let emb = bb.embed_rows(&flat);                                   // only b·l rows
     let hseq = Tensor::from_vec(emb, (b, l, dm), dev)?;
     let y = ssm_layer(&hseq, ssm, b, l, dm, dev)?.reshape((b * l, dm))?;
-    let gp = candle_nn::ops::softmax(&y.matmul(gate)?, D::Minus1)?;
+    // Quantizing the router is only worth it at LARGE expert counts. Measured at
+    // 8 experts it saved 3 KB but cost ~0.6 ms/token, because candle's f32 BLAS
+    // beats our kernel on a small dm×E matmul. At 8500 experts the router is
+    // 0.13 GB f32 and the trade flips. Q8ROUTER=1 opts in.
+    let gp = if std::env::var("Q8ROUTER").map(|v| v != "0").unwrap_or(false) {
+        let yv = y.contiguous()?.flatten_all()?.to_vec1::<f32>()?;
+        let gl = bb.route(&yv, b * l);
+        candle_nn::ops::softmax(&Tensor::from_vec(gl, (b * l, bb.n_exp), dev)?, D::Minus1)?
+    } else {
+        candle_nn::ops::softmax(&y.matmul(gate)?, D::Minus1)?
+    };
     let choice = gp.argmax(D::Minus1)?.to_vec1::<u32>()?;
     let probs = gp.to_vec2::<f32>()?;
     let n = choice.len();
@@ -1025,9 +1089,10 @@ fn main() -> Result<()> {
         // Q8=1 also quantizes the backbone (embedding + output head), which became
         // the dominant resident block once the experts stopped inflating to f32.
         let q8_backbone = std::env::var("Q8").map(|v| v != "0").unwrap_or(false);
-        let bb = if q8_backbone { Some(Q8Backbone::from_stored(&st)?) } else { None };
+        let bb = if q8_backbone { Some(Q8Backbone::from_stored(&st, moe.gate.as_tensor())?) } else { None };
         let stored_ram = match &bb {
-            Some(b) => b.bytes() + (6 * dmc + dmc * moe.experts.len()) * 4, // int8 tables + f32 ssm/gate
+            Some(b) => b.bytes() + 6 * dmc * 4
+                + if std::env::var("Q8ROUTER").map(|v| v != "0").unwrap_or(false) { 0 } else { dmc * moe.experts.len() * 4 },
             None => st.n_params() * 4 + dmc * moe.experts.len() * 4,        // all f32
         };
         println!("[paged] experts on DISK: {} experts × dff={dffc} = {:.1} KB int8 ({store})", moe.experts.len(), sz as f64 / 1024.0);
