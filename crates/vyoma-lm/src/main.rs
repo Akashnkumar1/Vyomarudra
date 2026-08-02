@@ -558,6 +558,47 @@ impl Q8Expert {
     }
 }
 
+// ---------------------------------------------------------------------------
+// int8 BACKBONE. Once the experts stopped inflating to f32, the embedding and
+// output head became the largest resident block — at vocab=32k, dm=4096 they are
+// 1.05 GB of a 1.33 GB working set, purely because they are two vocab×dm f32
+// matrices. Both are quantized here with the same kernel:
+//   * embed: only the looked-up rows are dequantized (b·l rows, not the vocab),
+//     so the table stays int8 in RAM and the cost is trivial.
+//   * head:  h @ woᵀ is exactly our (rows × k) int8 matmul shape — reused directly.
+// The SSM parameters stay f32: 4·dm per layer is noise.
+// ---------------------------------------------------------------------------
+struct Q8Backbone { embed: Vec<i8>, s_embed: f32, wo: Vec<i8>, s_wo: f32, bo: Vec<f32>, vocab: usize, dm: usize }
+
+impl Q8Backbone {
+    fn from_stored(st: &Stored) -> Result<Self> {
+        let e = st.embed.as_tensor();
+        let (vocab, dm) = e.dims2()?;
+        let ev = e.flatten_all()?.to_vec1::<f32>()?;
+        let (ec, s_embed) = q8(&ev);
+        let wv = st.wo.as_tensor().flatten_all()?.to_vec1::<f32>()?;
+        let (wc, s_wo) = q8(&wv);
+        Ok(Self { embed: ec, s_embed, wo: wc, s_wo, bo: st.bo.as_tensor().flatten_all()?.to_vec1::<f32>()?, vocab, dm })
+    }
+    /// RAM: two int8 vocab×dm tables + an f32 bias vector (vs 4× for all-f32).
+    fn bytes(&self) -> usize { self.embed.len() + self.wo.len() + self.bo.len() * 4 }
+    /// Dequantize ONLY the rows actually looked up — the table itself stays int8.
+    fn embed_rows(&self, ids: &[u32]) -> Vec<f32> {
+        let mut out = vec![0f32; ids.len() * self.dm];
+        for (i, &tok) in ids.iter().enumerate() {
+            let src = (tok as usize) * self.dm;
+            for k in 0..self.dm { out[i * self.dm + k] = self.embed[src + k] as f32 * self.s_embed; }
+        }
+        out
+    }
+    /// logits = h · woᵀ + bo, computed against int8 weights.
+    fn head(&self, h: &[f32], n: usize) -> Vec<f32> {
+        let mut out = Vec::new();
+        Q8Expert::matmul(h, n, self.dm, &self.wo, self.vocab, self.s_wo, &self.bo, &mut out);
+        out
+    }
+}
+
 /// Reads experts on demand from a VYX1 store, keeping only `cap` in RAM (LRU).
 /// The file is NOT loaded into memory — we seek+read only the requested expert's
 /// bytes, so the on-disk expert mass never counts against the working set. (An
@@ -661,6 +702,37 @@ fn forward_moe_paged(ids: &Tensor, st: &Stored, gate: &Tensor, pg: &mut PagedExp
     }
     let h = (y + out)?;
     Ok(h.matmul(&st.wo.as_tensor().t()?)?.broadcast_add(st.bo.as_tensor())?)
+}
+
+/// FULLY int8-resident forward: quantized embedding + paged int8 experts +
+/// quantized head. Nothing vocab-sized or expert-sized is ever f32 in RAM.
+fn forward_q8(ids: &Tensor, bb: &Q8Backbone, ssm: &SsmLayer, gate: &Tensor,
+              pg: &mut PagedExperts, dm: usize, dev: &Device) -> Result<Tensor> {
+    let (b, l) = ids.dims2()?;
+    let flat: Vec<u32> = ids.reshape((b * l,))?.to_vec1()?;
+    let emb = bb.embed_rows(&flat);                                   // only b·l rows
+    let hseq = Tensor::from_vec(emb, (b, l, dm), dev)?;
+    let y = ssm_layer(&hseq, ssm, b, l, dm, dev)?.reshape((b * l, dm))?;
+    let gp = candle_nn::ops::softmax(&y.matmul(gate)?, D::Minus1)?;
+    let choice = gp.argmax(D::Minus1)?.to_vec1::<u32>()?;
+    let probs = gp.to_vec2::<f32>()?;
+    let n = choice.len();
+    let mut groups: std::collections::HashMap<u32, Vec<u32>> = Default::default();
+    for (t, &e) in choice.iter().enumerate() { groups.entry(e).or_default().push(t as u32); }
+    let mut out = Tensor::zeros((n, dm), DType::F32, dev)?;
+    for (e, toks) in groups {
+        let ex = pg.fetch(e as usize, dev)?;
+        let idx = Tensor::from_vec(toks.clone(), (toks.len(),), dev)?;
+        let xs = y.contiguous()?.index_select(&idx, 0)?.flatten_all()?.to_vec1::<f32>()?;
+        let mut ff = ex.ffn(&xs, toks.len());
+        for (r, &t) in toks.iter().enumerate() {
+            let g = probs[t as usize][e as usize];
+            for c in 0..dm { ff[r * dm + c] *= g; }
+        }
+        out = out.index_add(&idx, &Tensor::from_vec(ff, (toks.len(), dm), dev)?, 0)?;
+    }
+    let h = (y + out)?.flatten_all()?.to_vec1::<f32>()?;
+    Ok(Tensor::from_vec(bb.head(&h, n), (n, bb.vocab), dev)?)   // int8 head
 }
 
 /// GENERATED MoE forward (Pillar 1 × Pillar 3): the E experts' weights come from a
@@ -950,9 +1022,17 @@ fn main() -> Result<()> {
         let sz = write_expert_store(&store, &moe, dmc, dffc)?;
         let mut pg = PagedExperts::open(&store, cap)?;
 
-        let stored_ram = st.n_params() * 4 + dmc * moe.experts.len() * 4; // embed+ssm+head+gate, fp32
+        // Q8=1 also quantizes the backbone (embedding + output head), which became
+        // the dominant resident block once the experts stopped inflating to f32.
+        let q8_backbone = std::env::var("Q8").map(|v| v != "0").unwrap_or(false);
+        let bb = if q8_backbone { Some(Q8Backbone::from_stored(&st)?) } else { None };
+        let stored_ram = match &bb {
+            Some(b) => b.bytes() + (6 * dmc + dmc * moe.experts.len()) * 4, // int8 tables + f32 ssm/gate
+            None => st.n_params() * 4 + dmc * moe.experts.len() * 4,        // all f32
+        };
         println!("[paged] experts on DISK: {} experts × dff={dffc} = {:.1} KB int8 ({store})", moe.experts.len(), sz as f64 / 1024.0);
-        println!("[paged] RAM: backbone+gate {:.1} KB + LRU cache of {cap} expert(s)", stored_ram as f64 / 1024.0);
+        println!("[paged] RAM: backbone+gate {:.1} KB ({}) + LRU cache of {cap} expert(s)",
+                 stored_ram as f64 / 1024.0, if q8_backbone { "int8" } else { "f32" });
 
         let codec = BpeCodec::load(&format!("{}/data_cache/bpe_merges.txt", env!("CARGO_MANIFEST_DIR")))?;
         let gate_t = moe.gate.as_tensor().clone();
@@ -965,7 +1045,10 @@ fn main() -> Result<()> {
             let s = ctx.len().saturating_sub(win);
             let w = &ctx[s..];
             let ids = Tensor::from_vec(w.to_vec(), (1, w.len()), &dev)?;
-            let logits = forward_moe_paged(&ids, &st, &gate_t, &mut pg, dmc, &dev)?;
+            let logits = match &bb {
+                Some(b) => forward_q8(&ids, b, &st.ssm[0], &gate_t, &mut pg, dmc, &dev)?,
+                None => forward_moe_paged(&ids, &st, &gate_t, &mut pg, dmc, &dev)?,
+            };
             let row: Vec<f32> = logits.narrow(0, w.len() - 1, 1)?.flatten_all()?.to_vec1()?;
             let mut idx: Vec<usize> = (0..row.len()).collect();
             idx.sort_by(|&a, &b| row[b].partial_cmp(&row[a]).unwrap_or(std::cmp::Ordering::Equal));
@@ -979,6 +1062,7 @@ fn main() -> Result<()> {
         }
         let el = t0.elapsed().as_secs_f64();
         let full_ram = stored_ram + (2 * dmc * dffc + dffc + dmc) * moe.experts.len() * 4;
+        let _ = &bb;
         let paged_ram = stored_ram + pg.resident_bytes();
         println!("[paged] generated {n_new} tokens in {el:.2}s ({:.2} ms/token)", el * 1000.0 / n_new as f64);
         println!("[paged] expert fetches: {} disk loads / {} cache hits ({:.0}% hit rate)",
