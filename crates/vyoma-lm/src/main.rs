@@ -513,6 +513,51 @@ fn write_expert_store(path: &str, moe: &Moe, dm: usize, dff: usize) -> Result<u6
     Ok(buf.len() as u64)
 }
 
+// ---------------------------------------------------------------------------
+// OUR int8 compute path. candle has no signed-int8 dtype (U8, U32, I64, BF16,
+// F16, F32, F64), so every quantized weight had to be dequantized to f32 the
+// moment it was paged in — int8 on disk, but 4× that in RAM, which is exactly
+// the number the memory thesis rests on. These weights are therefore held and
+// multiplied as i8 by our own kernel, outside candle: activations stay f32,
+// weights never materialize as f32, and the scale is applied once to the
+// accumulated dot product. Biases stay f32 (they are dff+dm elements — noise).
+// ---------------------------------------------------------------------------
+struct Q8Expert { w1: Vec<i8>, s1: f32, b1: Vec<f32>, w2: Vec<i8>, s2: f32, b2: Vec<f32>, dm: usize, dff: usize }
+
+impl Q8Expert {
+    /// RAM held by this expert: int8 weights + f32 biases (vs 4× for all-f32).
+    fn bytes(&self) -> usize { self.w1.len() + self.w2.len() + (self.b1.len() + self.b2.len()) * 4 }
+
+    /// out[t][o] = scale · Σ_k x[t][k]·w[o][k]  — int8 weights, f32 activations,
+    /// f32 accumulator. `w` is row-major (rows × k).
+    fn matmul(x: &[f32], t: usize, k: usize, w: &[i8], rows: usize, scale: f32, bias: &[f32], out: &mut Vec<f32>) {
+        out.clear();
+        out.resize(t * rows, 0.0);
+        for ti in 0..t {
+            let xr = &x[ti * k..(ti + 1) * k];
+            for o in 0..rows {
+                let wr = &w[o * k..(o + 1) * k];
+                let mut acc = 0f32;
+                for i in 0..k { acc += xr[i] * wr[i] as f32; }
+                out[ti * rows + o] = acc * scale + bias[o];
+            }
+        }
+    }
+
+    /// Full FFN for `t` tokens: x → w1 → gelu → w2 → out. No f32 weight ever exists.
+    fn ffn(&self, x: &[f32], t: usize) -> Vec<f32> {
+        let mut h = Vec::new();
+        Self::matmul(x, t, self.dm, &self.w1, self.dff, self.s1, &self.b1, &mut h);
+        for v in h.iter_mut() { // gelu (tanh approximation)
+            let x3 = *v * *v * *v;
+            *v = 0.5 * *v * (1.0 + ((2.0 / std::f32::consts::PI).sqrt() * (*v + 0.044715 * x3)).tanh());
+        }
+        let mut o = Vec::new();
+        Self::matmul(&h, t, self.dff, &self.w2, self.dm, self.s2, &self.b2, &mut o);
+        o
+    }
+}
+
 /// Reads experts on demand from a VYX1 store, keeping only `cap` in RAM (LRU).
 /// The file is NOT loaded into memory — we seek+read only the requested expert's
 /// bytes, so the on-disk expert mass never counts against the working set. (An
@@ -521,7 +566,7 @@ fn write_expert_store(path: &str, moe: &Moe, dm: usize, dff: usize) -> Result<u6
 struct PagedExperts {
     f: std::fs::File,
     n_exp: usize, dm: usize, dff: usize, per: usize,
-    cache: std::collections::HashMap<usize, (Tensor, Tensor, Tensor, Tensor)>,
+    cache: std::collections::HashMap<usize, std::rc::Rc<Q8Expert>>,
     order: Vec<usize>, cap: usize,
     pub loads: usize, pub hits: usize, pub bytes_read: usize,
 }
@@ -539,10 +584,11 @@ impl PagedExperts {
     }
     fn total_expert_bytes(&self) -> usize { self.n_exp * self.per }
     /// Bytes of expert weights actually resident in RAM (fp32 after dequant).
+    /// Real RAM held by cached experts — int8 weights + f32 biases, NOT 4×.
     fn resident_bytes(&self) -> usize {
-        self.cache.len() * (2 * self.dm * self.dff + self.dff + self.dm) * 4
+        self.cache.values().map(|e| e.bytes()).sum()
     }
-    fn fetch(&mut self, i: usize, dev: &Device) -> Result<(Tensor, Tensor, Tensor, Tensor)> {
+    fn fetch(&mut self, i: usize, _dev: &Device) -> Result<std::rc::Rc<Q8Expert>> {
         use std::io::{Read, Seek, SeekFrom};
         if let Some(t) = self.cache.get(&i) {
             self.hits += 1;
@@ -560,16 +606,17 @@ impl PagedExperts {
         let (s1, s2, s3, s4) = (f32le(0, &buf), f32le(4, &buf), f32le(8, &buf), f32le(12, &buf));
         let mut o = 16usize;
         let (dm, dff) = (self.dm, self.dff);
-        let mut take = |n: usize, s: f32, bytes: &[u8], o: &mut usize| -> Vec<f32> {
-            let v: Vec<f32> = (0..n).map(|k| (bytes[*o + k] as i8) as f32 * s).collect();
-            *o += n; v
+        // weights stay i8 (no f32 expansion); only the small biases become f32
+        let mut take_i8 = |n: usize, bytes: &[u8], o: &mut usize| -> Vec<i8> {
+            let v: Vec<i8> = (0..n).map(|k| bytes[*o + k] as i8).collect(); *o += n; v
         };
-        let w1 = take(dff * dm, s1, &buf, &mut o);
-        let b1 = take(dff, s2, &buf, &mut o);
-        let w2 = take(dm * dff, s3, &buf, &mut o);
-        let b2 = take(dm, s4, &buf, &mut o);
-        let t = (Tensor::from_vec(w1, (dff, dm), dev)?, Tensor::from_vec(b1, (dff,), dev)?,
-                 Tensor::from_vec(w2, (dm, dff), dev)?, Tensor::from_vec(b2, (dm,), dev)?);
+        let w1 = take_i8(dff * dm, &buf, &mut o);
+        let b1v = take_i8(dff, &buf, &mut o);
+        let w2 = take_i8(dm * dff, &buf, &mut o);
+        let b2v = take_i8(dm, &buf, &mut o);
+        let b1: Vec<f32> = b1v.iter().map(|&c| c as f32 * s2).collect();
+        let b2: Vec<f32> = b2v.iter().map(|&c| c as f32 * s4).collect();
+        let t = std::rc::Rc::new(Q8Expert { w1, s1, b1, w2, s2: s3, b2, dm, dff });
         if self.cache.len() >= self.cap {
             if let Some(ev) = self.order.first().copied() { self.order.remove(0); self.cache.remove(&ev); }
         }
@@ -599,14 +646,18 @@ fn forward_moe_paged(ids: &Tensor, st: &Stored, gate: &Tensor, pg: &mut PagedExp
 
     let mut out = Tensor::zeros((n, dm), DType::F32, dev)?;
     for (e, toks) in groups {
-        let (w1, b1, w2, b2) = pg.fetch(e as usize, dev)?;
+        let ex = pg.fetch(e as usize, dev)?;
         let idx = Tensor::from_vec(toks.clone(), (toks.len(),), dev)?;
-        let ys = y.index_select(&idx, 0)?;                       // (T, dm)
-        let ff = ys.matmul(&w1.t()?)?.broadcast_add(&b1)?.gelu()?
-                   .matmul(&w2.t()?)?.broadcast_add(&b2)?;       // (T, dm)
-        let w: Vec<f32> = toks.iter().map(|&t| probs[t as usize][e as usize]).collect();
-        let wt = Tensor::from_vec(w, (toks.len(), 1), dev)?;
-        out = out.index_add(&idx, &ff.broadcast_mul(&wt)?, 0)?;
+        let ys = y.contiguous()?.index_select(&idx, 0)?;          // (T, dm)
+        // OUR int8 kernel: weights are multiplied as i8, never expanded to f32
+        let xs = ys.flatten_all()?.to_vec1::<f32>()?;
+        let mut ff_v = ex.ffn(&xs, toks.len());
+        for (r, &t) in toks.iter().enumerate() {                  // scale by gate prob
+            let g = probs[t as usize][e as usize];
+            for c in 0..dm { ff_v[r * dm + c] *= g; }
+        }
+        let ff = Tensor::from_vec(ff_v, (toks.len(), dm), dev)?;
+        out = out.index_add(&idx, &ff, 0)?;
     }
     let h = (y + out)?;
     Ok(h.matmul(&st.wo.as_tensor().t()?)?.broadcast_add(st.bo.as_tensor())?)
