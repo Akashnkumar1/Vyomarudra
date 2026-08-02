@@ -32,6 +32,7 @@ docs (`docs/english/`) stay stable, this file moves.
 | Scaling / Chinchilla | ✅ within-corpus model+compute lowers BPB (2.008→1.847) then flattens = **data-bound at 1.34 MB** (MoE gap shrinks +0.115→+0.062). **Growing to 1.92 MB RECOVERS the gap (+0.062→+0.095)** = adding data relieves the bottleneck, capacity pays again. Model×data×compute scale together. Bottleneck = throughput/compute, not architecture |
 | Real web data + GPU (`vyoma-data`, FineWeb) | ✅✅ first non-teacher, real-web-text result, on Kaggle T4: **MoE 2.677 BPB beats dense-small 2.797 (+0.120) AND dense-big 2.801 (−0.123, 3.1× fewer active params)** on 210M real tokens. Portable CPU/CUDA/Metal build; `ONLY=` split for 2-GPU parallelism |
 | BPE on FineWeb (`vyoma-tokenizer` fineweb) | ✅ **−30% BPB** (2.797→1.936 dense-small; MoE 1.912 best-on-FineWeb) — biggest single lever, confirmed on real web text. MoE edge shrinks +0.120→+0.024 **mechanistically**: at vocab 4096 embed+head = ~89% of params, so FFN (where MoE acts) is only ~11% — same effect, diluted. Fix = grow DFF |
+| **FineWeb 30k-step runs** | ✅✅ **BPB 1.768 (4 exp) / 1.701 (16 exp)** — 4x experts, 2x params, better BPB at **identical active compute** (3.547M vs 3.552M). Writes real English. The mission thesis, measured on real web text |
 | Expert paging (`MODE=paged`) | ✅ **the mission's mechanism**: experts on disk int8 (`VYX1`), only routed expert in RAM. Toy 2.10x smaller working set; at real dims (99.9% experts) a **trillion-param model needs ~2 GB RAM** — RAM flat as experts grow, capacity costs DISK not memory |
 | Direction | **Retrieval-centric hybrid + sparse MoE**: our retriever + on-disk store + lean SSM + top-1 experts (STORED + int8, not generated); generation stays an image-regime multiplier; teacher teaches only |
 | Next (all ours) | firm up retrolm at scale (BPE + bigger model/context + more seeds); build a real MoE (Pillar 3); grow the distilled corpus |
@@ -64,6 +65,56 @@ stays honest.
 ---
 
 ## Log
+
+### 2026-08-02 — 30k steps on FineWeb: BPB 1.768 → 1.701, and the mission thesis proven on real data ✅✅✅
+
+**What.** Two full 30,000-step runs on real FineWeb web text, one per T4, differing
+only in expert count. Both completed, both checkpointed every 500 steps.
+
+| model | BPB | total params | **active params** | ckpt |
+|---|---|---|---|---|
+| MoE 4 experts | **1.768** | 4,729,344 | 3,547,008 | 19 MB |
+| MoE 16 experts | **1.701** | 9,463,296 | **3,551,616** | 37 MB |
+
+**The result the mission rests on.** 4× the experts and 2× the total parameters buy
+a better model (−0.067 BPB) at **identical active compute** — active params differ by
+just 4,608 (the larger gate). Capacity scales with expert count; the per-token cost
+does not. Combined with paging (below), RAM does not scale either. This is the
+empirical core of the trillion-parameter argument, measured on real web text with
+our own code.
+
+Mechanistically visible in the loss curve too: the 4-expert model plateaued around
+step ~13,000 (loss ~4.30, then oscillating) — it ran out of capacity, not data. More
+experts was exactly the right lever.
+
+**Best BPB progression on FineWeb:** 2.677 (char, 6k steps) → 1.912 (BPE, 6k) →
+**1.768** (BPE, 30k, 4 exp) → **1.701** (BPE, 30k, 16 exp).
+
+**It writes real English now.** 4-expert model, prompt *"The future of artificial
+intelligence is"*:
+
+> "…about an abortion of this and many other people to have the potential.
+> **Therefore**, some who need to be a better sense for the purpose of the state.
+> **The major issue is** not that there is a chance to get the most respectfully, the
+> government which can have an impact… **Since** those are also important to avoid
+> the end of the process."
+
+Grammatical clauses, function words, articles, agreement, discourse connectives
+(*Therefore*, *Since*). Semantically it drifts and invents words — it is a 5 M-param
+model — but this is fluent English *structure*, a world away from the Shakespeare-era
+`hirest;`.
+
+**Paging verified on a real trained model** (16 experts, cache=1): experts 6.16 MB
+int8 on disk; RAM all-resident 36.1 MB → paged **13.5 MB (2.66× smaller)** at
+19.75 ms/token (real disk reads + dequant). The mechanism holds outside the toy.
+
+**Operational lessons (hard-won).** Kaggle reaps a session after **40 minutes of
+notebook-cell inactivity** — it cannot see tmux or GPU load, which is why sessions
+kept dying. Fix: keep a cell running (`!tail -f train.log`) for the full 12 h. Also:
+`~/.cargo` is wiped on restart while `/kaggle/working` survives, and binaries lose
+their exec bit (`chmod +x` needed). Periodic checkpointing (CKPT_EVERY) proved its
+worth immediately — a restart that would have destroyed 30k steps cost nothing.
+
 
 ### 2026-08-02 — Expert paging: a trillion-parameter architecture with a ~2 GB working set
 
