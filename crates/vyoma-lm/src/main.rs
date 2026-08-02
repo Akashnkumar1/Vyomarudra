@@ -1082,8 +1082,12 @@ fn load_moe_ckpt(path: &str, dev: &Device) -> Result<(Stored, Moe, usize, usize)
     let embed = g("embed")?;
     let (vocab, dm) = embed.dims2()?;
     let n_layers = (0..).take_while(|i| t.contains_key(&format!("ssm.{i}.a_raw"))).count().max(1);
+    // Legacy layout counts experts as `moe.{E}.w1`; the multi-layer layout uses
+    // `moe.l{L}.{E}.w1`. Validate against whichever the file actually contains,
+    // rather than assuming the old one (which rejected new checkpoints outright).
     let n_exp = (0..).take_while(|i| t.contains_key(&format!("moe.{i}.w1"))).count();
-    anyhow::ensure!(n_exp > 0, "checkpoint has no experts");
+    let n_exp_ml = (0..).take_while(|i| t.contains_key(&format!("moe.l0.{i}.w1"))).count();
+    anyhow::ensure!(n_exp > 0 || n_exp_ml > 0, "checkpoint has no experts");
     let mut ssm = Vec::with_capacity(n_layers);
     for i in 0..n_layers {
         ssm.push(SsmLayer {

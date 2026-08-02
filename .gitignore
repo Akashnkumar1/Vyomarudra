@@ -3,3 +3,4 @@
 **/data_cache/
 Cargo.lock
 .DS_Store
+/models
