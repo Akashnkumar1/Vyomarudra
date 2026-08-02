@@ -416,11 +416,35 @@ fn forward_moe(ids: &Tensor, st: &Stored, moe: &Moe, dm: usize, dev: &Device) ->
     let maxp = gp.max_keepdim(D::Minus1)?.broadcast_as((n, e))?;
     let mask = gp.eq(&maxp)?.to_dtype(DType::F32)?;           // (N,E) top-1 one-hot
     let w = gp.mul(&mask)?;                                   // (N,E) chosen expert's prob
-    let mut out = Tensor::zeros((n, dm), DType::F32, dev)?;
-    for ei in 0..e {
-        let ff = moe.experts[ei].apply(&y)?;                  // (N,dm)
-        out = (out + ff.broadcast_mul(&w.narrow(1, ei, 1)?)?)?;
-    }
+    // SPARSE (gathered) expert compute. The obvious implementation applies EVERY
+    // expert to EVERY token and zeroes the unselected ones — correct, but it burns
+    // E× the FLOPs to train a model where top-1 routing uses exactly one expert per
+    // token (64 experts made training ~16× slower than 4). Instead: group the token
+    // indices by their routed expert and run each expert once, on only its own
+    // tokens. index_select/index_add keep this differentiable, so training gets the
+    // same sparsity inference already had. GATHER=0 falls back to the dense path.
+    let gathered = std::env::var("GATHER").map(|v| v != "0").unwrap_or(true);
+    let out = if gathered {
+        let choice = gp.argmax(D::Minus1)?.to_vec1::<u32>()?;
+        let mut groups: std::collections::HashMap<u32, Vec<u32>> = Default::default();
+        for (t, &ex) in choice.iter().enumerate() { groups.entry(ex).or_default().push(t as u32); }
+        let mut acc = Tensor::zeros((n, dm), DType::F32, dev)?;
+        for (ex, toks) in groups {
+            let idx = Tensor::from_vec(toks.clone(), (toks.len(),), dev)?;
+            let ys = y.contiguous()?.index_select(&idx, 0)?;          // (T,dm) this expert's tokens
+            let ff = moe.experts[ex as usize].apply(&ys)?;            // (T,dm) one expert, once
+            let wsel = w.narrow(1, ex as usize, 1)?.contiguous()?.index_select(&idx, 0)?; // (T,1)
+            acc = acc.index_add(&idx, &ff.mul(&wsel.broadcast_as(ff.shape())?)?, 0)?;
+        }
+        acc
+    } else {
+        let mut acc = Tensor::zeros((n, dm), DType::F32, dev)?;
+        for ei in 0..e {
+            let ff = moe.experts[ei].apply(&y)?;
+            acc = (acc + ff.broadcast_mul(&w.narrow(1, ei, 1)?)?)?;
+        }
+        acc
+    };
     let h = (y + out)?;                                       // residual
     let logits = h.matmul(&st.wo.as_tensor().t()?)?.broadcast_add(st.bo.as_tensor())?;
     // Switch-style load balance: E · Σ_e f_e · P_e  (minimized ⇒ balanced routing)
