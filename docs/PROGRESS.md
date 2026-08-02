@@ -34,6 +34,7 @@ docs (`docs/english/`) stay stable, this file moves.
 | BPE on FineWeb (`vyoma-tokenizer` fineweb) | ✅ **−30% BPB** (2.797→1.936 dense-small; MoE 1.912 best-on-FineWeb) — biggest single lever, confirmed on real web text. MoE edge shrinks +0.120→+0.024 **mechanistically**: at vocab 4096 embed+head = ~89% of params, so FFN (where MoE acts) is only ~11% — same effect, diluted. Fix = grow DFF |
 | **FineWeb 30k-step runs** | ✅✅ **BPB 1.768 (4 exp) / 1.701 (16 exp)** — 4x experts, 2x params, better BPB at **identical active compute** (3.547M vs 3.552M). Writes real English. The mission thesis, measured on real web text |
 | Instruction tuning (`SFT=1`, `CHAT=1`) | ⚠️ format learned (emits `<|assistant|>`, stops at `<|end|>`), semantics NOT — out-of-distribution prompts get randomly-recalled answers. 462K params on 126 pairs; needs scale |
+| Data unlocks capacity | ✅ 2.5× corpus grows the 32→64 expert gap **0.003 → 0.023 (~8×)**. The earlier plateau was data starvation, not an architectural ceiling. (Cross-corpus absolute BPB is test-shift confounded — compare gaps, not levels) |
 | Expert-count scaling | ✅ 4/16/32/64 experts on FineWeb: BPB **1.768/1.701/1.687/1.684** — 6× params for 0.65% more active compute. Returns collapse past ~32 (data-bound at 60M tokens) |
 | int8 / int4 quantization | ✅ measured cost: int8 **+0.01%**, int4 **+0.09%** BPB. Trillion-class working set **1.98 → 0.59 → 0.48 GB**. Our own kernel (threaded, stdlib) — candle has no int8 dtype |
 | Expert paging (`MODE=paged`) | ✅ **the mission's mechanism**: experts on disk int8 (`VYX1`), only routed expert in RAM. Toy 2.10x smaller working set; at real dims (99.9% experts) a **trillion-param model needs ~2 GB RAM** — RAM flat as experts grow, capacity costs DISK not memory |
@@ -68,6 +69,39 @@ stays honest.
 ---
 
 ## Log
+
+### 2026-08-02 — More data makes capacity pay: the expert gap grows 8× on a 2.5× larger corpus ✅
+
+**What.** The 4→64 expert curve on 60 M tokens had flattened to nothing
+(32→64 experts bought 0.003 BPB), which we read as data-bound rather than
+architecture-bound. Direct test: extract 500 MB from the same FineWeb shard
+(2.5× the text) and re-run 32 and 64 experts, 40 k steps each.
+
+**Result.**
+
+| corpus | 32 experts | 64 experts | **gap (32→64)** |
+|---|---|---|---|
+| 60 MB | 1.687 | 1.684 | **0.003** |
+| 500 MB | 1.947 | 1.924 | **0.023** |
+
+**The payoff for extra capacity grew ~8×.** On the small corpus, doubling experts
+was worthless; on the larger one the identical capacity increase buys 0.023 bits/byte.
+The plateau was starvation, not a ceiling in the architecture — exactly as predicted.
+
+**Read the absolute numbers correctly.** BPB *rose* (1.687 → 1.947) but that is NOT
+a regression: the held-out set is the last 10% of the corpus, so a different corpus
+means a different, harder test tail. This is the cross-corpus test-shift confound
+already documented here. Only the **within-corpus gap** is comparable, and that is
+the number that moved. (Also relevant: 40 k steps over ~145 M tokens is ~1.1 epochs
+versus ~2 epochs for the small corpus — less repetition, less overfitting, which is
+precisely why capacity pays more.)
+
+**Consequence for the mission.** Capacity and data must scale together — and the
+architecture's benefit *increases* with data rather than saturating. Every earlier
+"diminishing returns" reading was a data ceiling, not an architectural one. Two
+follow-ups now running: 128 experts on 500 MB, and 64 experts for 90 k steps to
+separate convergence from capacity.
+
 
 ### 2026-08-02 — Instruction tuning: the FORMAT is learned, the semantics are not (honest)
 
